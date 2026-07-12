@@ -3,8 +3,10 @@ import * as path from 'path'
 import * as LSP from 'vscode-languageserver'
 import * as Parser from 'web-tree-sitter'
 
+import { parseBashIdeDirectives } from './bash-ide-directives'
 import { parseShellCheckDirective } from '../shellcheck/directive'
 import { discriminate } from './discriminate'
+import { tryGetSingleValue } from './flow-value'
 import { untildify } from './fs'
 import * as TreeSitterUtil from './tree-sitter'
 
@@ -17,27 +19,52 @@ export type SourceCommand = {
 }
 
 /**
+ * Options for getSourceCommands.
+ */
+export interface GetSourceCommandsOptions {
+  fileUri: string
+  rootPath: string | null
+  tree: Parser.Tree
+  /** Optional flow bindings for dynamic path resolution. */
+  flowBindings?: Map<string, import('./flow-value').FlowValue>
+  /** Current working directory (from bash-ide cwd directive). */
+  cwd?: string
+}
+
+/**
  * Analysis the given tree for source commands.
  */
 export function getSourceCommands({
   fileUri,
   rootPath,
   tree,
-}: {
-  fileUri: string
-  rootPath: string | null
-  tree: Parser.Tree
-}): SourceCommand[] {
+  flowBindings,
+  cwd,
+}: GetSourceCommandsOptions): SourceCommand[] {
   const sourceCommands: SourceCommand[] = []
 
-  const rootPaths = [path.dirname(fileUri), rootPath].filter(Boolean) as string[]
+  const defaultRootPaths = [path.dirname(fileUri), rootPath].filter(Boolean) as string[]
+
+  // Check for bash-ide source-path directives
+  const fileContent = tree.rootNode?.text || ''
+  const bashIdeDir = parseBashIdeDirectives(fileContent)
+
+  // Extract source-path from bash-ide directives (using cwd already set)
+  const effectiveCwd = cwd || path.dirname(fileUri)
 
   TreeSitterUtil.forEach(tree.rootNode, (node) => {
-    const sourcedPathInfo = getSourcedPathInfoFromNode({ node })
+    const sourcedPathInfo = getSourcedPathInfoFromNode({
+      node,
+      flowBindings,
+      defaultRootPaths,
+      cwd: effectiveCwd,
+    })
 
     if (sourcedPathInfo) {
       const { sourcedPath, parseError } = sourcedPathInfo
-      const uri = sourcedPath ? resolveSourcedUri({ rootPaths, sourcedPath }) : null
+      const uri = sourcedPath
+        ? resolveSourcedUri({ rootPaths: defaultRootPaths, sourcedPath, cwd: effectiveCwd })
+        : null
 
       sourceCommands.push({
         range: TreeSitterUtil.range(node),
@@ -54,8 +81,14 @@ export function getSourceCommands({
 
 function getSourcedPathInfoFromNode({
   node,
+  flowBindings,
+  defaultRootPaths,
+  cwd,
 }: {
   node: Parser.SyntaxNode
+  flowBindings?: Map<string, import('./flow-value').FlowValue>
+  defaultRootPaths: string[]
+  cwd?: string
 }): null | { sourcedPath?: string; parseError?: string } {
   if (node.type === 'command') {
     const [commandNameNode, argumentNode] = node.namedChildren
@@ -114,6 +147,22 @@ function getSourcedPathInfoFromNode({
         const [variableNode] = argumentNode.namedChildren
         if (TreeSitterUtil.isExpansion(variableNode)) {
           const stringContents = argumentNode.text.slice(1, -1)
+          
+          // Try to resolve using flow bindings
+          if (flowBindings) {
+            const varNameNode = variableNode.descendantsOfType('variable_name')[0]
+            if (varNameNode) {
+              const binding = flowBindings.get(varNameNode.text)
+              if (binding) {
+                const val = tryGetSingleValue(binding)
+                if (val !== null) {
+                  const remainingPath = stringContents.slice(variableNode.text.length)
+                  return { sourcedPath: val + remainingPath }
+                }
+              }
+            }
+          }
+          
           if (stringContents.startsWith(`${variableNode.text}/`)) {
             return {
               sourcedPath: `.${stringContents.slice(variableNode.text.length)}`,
@@ -124,10 +173,21 @@ function getSourcedPathInfoFromNode({
 
       if (argumentNode.type === 'concatenation') {
         // Strip one leading dynamic section from a concatenation node.
-        const sourcedPath = resolveSourceFromConcatenation(argumentNode)
+        const sourcedPath = resolveSourceFromConcatenation(argumentNode, flowBindings)
         if (sourcedPath) {
           return {
             sourcedPath,
+          }
+        }
+      }
+
+      // Try to resolve using flow bindings for variable references
+      if (flowBindings && argumentNode.type === 'word') {
+        const binding = flowBindings.get(argumentNode.text)
+        if (binding) {
+          const val = tryGetSingleValue(binding)
+          if (val !== null) {
+            return { sourcedPath: val }
           }
         }
       }
@@ -156,9 +216,11 @@ function getSourcedPathInfoFromNode({
 function resolveSourcedUri({
   rootPaths,
   sourcedPath,
+  cwd,
 }: {
   rootPaths: string[]
   sourcedPath: string
+  cwd?: string
 }): string | null {
   if (sourcedPath.startsWith('~')) {
     sourcedPath = untildify(sourcedPath)
@@ -171,8 +233,11 @@ function resolveSourcedUri({
     return null
   }
 
+  // If cwd is explicitly set (via bash-ide cwd directive), use it first
+  const allRootPaths = cwd ? [cwd, ...rootPaths] : rootPaths
+
   // resolve  relative path
-  for (const rootPath of rootPaths) {
+  for (const rootPath of allRootPaths) {
     const potentialPath = path.join(rootPath.replace('file://', ''), sourcedPath)
 
     // check if path is a file
@@ -189,7 +254,10 @@ function resolveSourcedUri({
  * Returns null if the source path can't be statically determined after stripping a segment.
  * Note: If a non-concatenation node is passed, null will be returned. This is likely a programmer error.
  */
-function resolveSourceFromConcatenation(node: Parser.SyntaxNode): string | null {
+function resolveSourceFromConcatenation(
+  node: Parser.SyntaxNode,
+  flowBindings?: Map<string, import('./flow-value').FlowValue>,
+): string | null {
   if (node.type !== 'concatenation') return null
   const stringValue = TreeSitterUtil.resolveStaticString(node)
   if (stringValue !== null) return stringValue // This string is fully static.
@@ -197,6 +265,26 @@ function resolveSourceFromConcatenation(node: Parser.SyntaxNode): string | null 
   const values: string[] = []
   // Since the string must begin with the variable, the variable must be in the first child.
   const [firstNode, ...rest] = node.namedChildren
+  
+  // Try to resolve first node via flow bindings
+  if (flowBindings && TreeSitterUtil.isExpansion(firstNode)) {
+    const varNameNode = firstNode.descendantsOfType('variable_name')[0]
+    if (varNameNode) {
+      const binding = flowBindings.get(varNameNode.text)
+      if (binding) {
+        const val = tryGetSingleValue(binding)
+        if (val !== null) {
+          for (const child of rest) {
+            const childValue = TreeSitterUtil.resolveStaticString(child)
+            if (childValue === null) return null
+            values.push(childValue)
+          }
+          return val + values.join('')
+        }
+      }
+    }
+  }
+  
   // The first child is static, this means one of the other children is not!
   if (TreeSitterUtil.resolveStaticString(firstNode) !== null) return null
 

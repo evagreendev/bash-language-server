@@ -25,7 +25,7 @@
   "activationEvents": [
     "onLanguage:shellscript"
   ],
-  "main": "./out/extension",
+  "main": "./out/extension.js",
   "contributes": {
     "configuration": {
       "type": "object",
@@ -36,6 +36,11 @@
           "default": 500,
           "description": "Maximum number of files to analyze in the background. Set to 0 to disable background analysis.",
           "minimum": 0
+        },
+        "bashIde.enableFlowAnalysis": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable flow-sensitive analysis for resolving variable values, constant branch evaluation, and dynamic source resolution. When enabled, inlay hints show resolved variable values and untaken constexpr branches are dimmed."
         },
         "bashIde.enableSourceErrorDiagnostics": {
           "type": "boolean",
@@ -135,15 +140,53 @@
           "type": "boolean",
           "default": false,
           "description": "Follow redirection operators with a space."
+        },
+        "bashIde.seedVariables": {
+          "type": "object",
+          "default": {},
+          "description": "Pre-seeded variable values for flow analysis. Use this to inject variable bindings for variables not present in the server environment but needed to resolve source paths or directives.",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "bashIde.pathEnvInit": {
+          "type": "array",
+          "default": [],
+          "description": "Path-based environment initialization rules. An array of rules where, when a file path matches the glob pattern (with (*) capture groups), variables are seeded and envInit is sourced to inject bindings before analysis.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string",
+                "description": "Glob pattern to match file paths. Use (*) for capture groups referenced as $1, $2, etc."
+              },
+              "envInit": {
+                "type": "string",
+                "description": "A command to run (e.g. 'source /path/to/env.sh') before analysis. $1, $2, etc. are expanded from capture groups."
+              },
+              "variables": {
+                "type": "object",
+                "description": "Variables to seed. $1, $2, etc. are expanded from capture groups.",
+                "additionalProperties": {
+                  "type": "string"
+                }
+              },
+              "sourcePushd": {
+                "type": "boolean",
+                "description": "Automatically set PWD to the sourced file's directory."
+              }
+            },
+            "required": ["path"]
+          }
         }
       }
     }
   },
   "scripts": {
-    "vscode:prepublish": "cd .. && pnpm compile"
+    "vscode:prepublish": "cd $(realpath .)/.. && pnpm compile"
   },
   "dependencies": {
-    "bash-language-server": "5.4.2",
+    "bash-language-server": "link:../server",
     "vscode-languageclient": "8.1.0",
     "vscode-languageserver": "8.0.2"
   },

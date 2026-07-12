@@ -6,6 +6,11 @@ export const ConfigSchema = z.object({
   // Maximum number of files to analyze in the background. Set to 0 to disable background analysis.
   backgroundAnalysisMaxFiles: z.number().int().min(0).default(500),
 
+  // Enable flow-sensitive analysis for resolving variable values, constant branch evaluation,
+  // and dynamic source resolution. When enabled, inlay hints show resolved variable values
+  // and untaken constexpr branches are dimmed.
+  enableFlowAnalysis: z.boolean().default(false),
+
   // Enable diagnostics for source errors. Ignored if includeAllWorkspaceSymbols is true.
   enableSourceErrorDiagnostics: z.boolean().default(false),
 
@@ -76,6 +81,32 @@ export const ConfigSchema = z.object({
       spaceRedirects: z.boolean().default(false),
     })
     .default({}),
+
+  // Pre-seeded variable values for flow analysis. Use this to inject variable
+  // bindings for variables not present in the server environment but needed
+  // to resolve source paths or directives.
+  // Example: { "MY_LIB_DIR": "/opt/libs" }
+  seedVariables: z.record(z.string(), z.string()).default({}),
+
+  // Path-based environment initialization rules. An array of rules where, when
+  // a file path matches the glob pattern (with (*) capture groups), variables
+  // are seeded and envInit is sourced to inject bindings before analysis.
+  // sourcePushd-only rules apply additively.
+  // Example:
+  // [{
+  //   "path": "projects/(*)/*.sh",
+  //   "variables": { "PROJECT": "$1" },
+  //   "envInit": "source /opt/$1/env.sh",
+  //   "sourcePushd": true
+  // }]
+  pathEnvInit: z.array(
+    z.object({
+      path: z.string(),
+      envInit: z.string().optional(),
+      variables: z.record(z.string(), z.string()).optional(),
+      sourcePushd: z.boolean().optional(),
+    })
+  ).default([]),
 })
 
 export type Config = z.infer<typeof ConfigSchema>
@@ -105,6 +136,9 @@ export function getConfigFromEnvironmentVariables(): {
       simplifyCode: toBoolean(process.env.SHFMT_SIMPLIFY_CODE),
       spaceRedirects: toBoolean(process.env.SHFMT_SPACE_REDIRECTS),
     },
+    enableFlowAnalysis: toBoolean(process.env.ENABLE_FLOW_ANALYSIS),
+    seedVariables: {},
+    pathEnvInit: [],
   }
 
   const environmentVariablesUsed = Object.entries(rawConfig)

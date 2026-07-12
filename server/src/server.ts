@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process'
+import * as fs from 'node:fs'
 import * as path from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
 
@@ -16,6 +17,12 @@ import { Linter, LintingResult } from './shellcheck'
 import { Formatter } from './shfmt'
 import { SNIPPETS } from './snippets'
 import { BashCompletionItem, CompletionItemDataType } from './types'
+import {
+  getCompgenCompletions,
+  getFileCompletions,
+  isFilePathContext,
+} from './util/compgen'
+import { formatFlowValue, tryGetArrayElements } from './util/flow-value'
 import { uniqueBasedOnHash } from './util/array'
 import { logger, setLogConnection, setLogLevel } from './util/logger'
 import { isPositionIncludedInRange } from './util/lsp'
@@ -136,6 +143,9 @@ export default class BashServer {
       },
       renameProvider: { prepareProvider: true },
       documentFormattingProvider: true,
+      inlayHintProvider: {
+        resolveProvider: false,
+      },
     }
   }
 
@@ -180,6 +190,10 @@ export default class BashServer {
     connection.onPrepareRename(this.onPrepareRename.bind(this))
     connection.onRenameRequest(this.onRenameRequest.bind(this))
     connection.onDocumentFormatting(this.onDocumentFormatting.bind(this))
+    // Inlay hints are registered conditionally (not all LSP clients support them)
+    if (connection.languages?.inlayHint) {
+      connection.languages.inlayHint.on(this.onInlayHint.bind(this))
+    }
 
     /**
      * The initialized notification is sent from the client to the server after
@@ -299,6 +313,8 @@ export default class BashServer {
             this.config.includeAllWorkspaceSymbols,
           )
 
+          this.analyzer.setConfig(this.config)
+
           if (!isDefaultConfig) {
             // We skip setting the log level as the default configuration should
             // not override the environment defined log level.
@@ -323,6 +339,22 @@ export default class BashServer {
 
     // Load the tree for the modified contents into the analyzer:
     let diagnostics = this.analyzer.analyze({ uri, document })
+
+    // Add dimming diagnostics for untaken constexpr branches
+    if (this.config.enableFlowAnalysis) {
+      const dimmedRanges = this.analyzer.getDimmedRanges(uri)
+      for (const range of dimmedRanges) {
+        diagnostics.push(
+          LSP.Diagnostic.create(
+            range,
+            'Code in this branch is never executed (constant condition)',
+            LSP.DiagnosticSeverity.Hint,
+            undefined,
+            'bash-language-server (flow analysis)',
+          ),
+        )
+      }
+    }
 
     // Run ShellCheck diagnostics:
     if (this.linter) {
@@ -444,8 +476,8 @@ export default class BashServer {
     this.logRequest({ request: 'onCompletion', params, word })
 
     if (word?.startsWith('#')) {
-      // Inside a comment block
-      return []
+      // Inside a comment block — check for shellcheck source=/source-fallback= directive completion
+      return this.getShellcheckDirectiveCompletions(params, word)
     }
 
     if (word === '{') {
@@ -563,12 +595,76 @@ export default class BashServer {
       }
     }
 
+    let filePathCompletions: BashCompletionItem[] = []
+    const isPathContext =
+      (word && isFilePathContext(word)) ||
+      // Also offer file completions when at start of a new argument after a command
+      (word === null && this.analyzer.commandNameAtPoint(
+        currentUri,
+        params.position.line,
+        Math.max(params.position.character - 1, 0),
+      ) !== null)
+
+    if (isPathContext) {
+      const doc = this.analyzer.getDocument(currentUri)
+      const currentFileDir = doc
+        ? path.dirname(currentUri.replace('file://', ''))
+        : this.workspaceFolder || process.cwd()
+
+      const files = getFileCompletions(word || '', currentFileDir)
+      const editRange: LSP.Range = {
+        start: {
+          character: params.position.character - (word?.length || 0),
+          line: params.position.line,
+        },
+        end: {
+          character: params.position.character,
+          line: params.position.line,
+        },
+      }
+      filePathCompletions = files.map((file) => ({
+        label: file,
+        kind: file.endsWith('/')
+          ? LSP.CompletionItemKind.Folder
+          : LSP.CompletionItemKind.File,
+        data: { type: CompletionItemDataType.Symbol },
+        textEdit: {
+          newText: file,
+          range: editRange,
+        },
+      }))
+    }
+
+    // Compgen-based command completions (when not completing options)
+    let compgenCompletions: BashCompletionItem[] = []
+    if (word && !word.startsWith('-') && !word.startsWith('$')) {
+      try {
+        const commands = getCompgenCompletions('command', word)
+        const seen = new Set<string>()
+        compgenCompletions = commands
+          .filter((cmd) => {
+            if (seen.has(cmd)) return false
+            seen.add(cmd)
+            return true
+          })
+          .map((cmd) => ({
+            label: cmd,
+            kind: LSP.CompletionItemKind.Function,
+            data: { type: CompletionItemDataType.Executable },
+          }))
+      } catch {
+        // compgen not available, skip
+      }
+    }
+
     const allCompletions = [
       ...reservedWordsCompletions,
       ...symbolCompletions,
       ...programCompletions,
       ...builtinsCompletions,
       ...optionsCompletions,
+      ...filePathCompletions,
+      ...compgenCompletions,
       ...SNIPPETS,
     ]
 
@@ -682,6 +778,12 @@ export default class BashServer {
       }
     }
 
+    // Show flow-resolved values for variables with known bindings
+    if (this.config.enableFlowAnalysis) {
+      const flowHover = this.getFlowValueHover(word, currentUri, params.position)
+      if (flowHover) return flowHover
+    }
+
     const symbolsMatchingWord = this.analyzer.findDeclarationsMatchingWord({
       exactMatch: true,
       uri: currentUri,
@@ -721,6 +823,50 @@ export default class BashServer {
     }
 
     return null
+  }
+
+  /**
+   * Build a hover showing the flow-resolved value of a variable.
+   */
+  private getFlowValueHover(
+    word: string,
+    uri: string,
+    position: LSP.Position,
+  ): LSP.Hover | null {
+    const bindings = this.analyzer.getFlowBindings(uri)
+    if (!bindings) return null
+
+    // Strip $ and ${} prefixes to get the bare variable name
+    let varName = word
+    if (varName.startsWith('$')) {
+      varName = varName.slice(1)
+      if (varName.startsWith('{')) varName = varName.slice(1)
+      if (varName.endsWith('}')) varName = varName.slice(0, -1)
+    }
+
+    const binding = bindings.get(varName)
+    if (!binding) return null
+
+    const label = formatFlowValue(binding)
+    if (!label) return null
+
+    const elements = tryGetArrayElements(binding)
+    let markdown = `**$${varName}** ${label}`
+
+    if (elements && elements.length > 0) {
+      markdown += '\n\n| Index | Value |\n|-------|-------|\n'
+      for (let i = 0; i < elements.length; i++) {
+        markdown += `| ${i} | \`${elements[i]}\` |\n`
+      }
+      markdown += `\n\nJoined: \`${elements.join(' ')}\``
+    }
+
+    return {
+      contents: {
+        kind: 'markdown',
+        value: markdown,
+      },
+    }
   }
 
   private onReferences(params: LSP.ReferenceParams): LSP.Location[] | null {
@@ -844,6 +990,76 @@ export default class BashServer {
     }
 
     return null
+  }
+
+  private onInlayHint(params: LSP.InlayHintParams): LSP.InlayHint[] {
+    logger.debug(`onInlayHint for ${params.textDocument.uri}`)
+
+    if (!this.config.enableFlowAnalysis) {
+      return []
+    }
+
+    const inlayHints = this.analyzer.getInlayHints(params.textDocument.uri)
+
+    // Convert internal InlayHint to LSP InlayHint
+    return inlayHints.map((hint) => ({
+      position: hint.position,
+      label: hint.label,
+      kind: LSP.InlayHintKind.Type,
+      paddingLeft: hint.paddingLeft,
+    }))
+  }
+
+  /**
+   * Provide path completions inside shellcheck source=/source-fallback= directives.
+   */
+  private getShellcheckDirectiveCompletions(
+    params: LSP.TextDocumentPositionParams,
+    word: string,
+  ): BashCompletionItem[] {
+    const uri = params.textDocument.uri
+    const { position } = params
+    const document = this.documents.get(uri)
+    if (!document) return []
+
+    // Get the current line text
+    const lineText = document.getText({
+      start: { line: position.line, character: 0 },
+      end: { line: position.line + 1, character: 0 },
+    })
+
+    // Check if we're in a shellcheck source=/source-fallback= directive
+    const sourceMatch = lineText.match(/#\s*shellcheck\s+(?:.*\s+)?(source|source-fallback)=(.*)$/)
+    if (!sourceMatch) return []
+
+    const afterEquals = sourceMatch[2] || ''
+    const searchPrefix = word.startsWith('#') ? afterEquals : afterEquals
+
+    // Use the workspace folder to search for files
+    const rootPath = this.workspaceFolder
+    if (!rootPath) return []
+
+    try {
+      const searchDir = path.dirname(uri.replace('file://', ''))
+      const entries = fs.readdirSync(searchDir, { withFileTypes: true })
+
+      const completions: BashCompletionItem[] = []
+      for (const entry of entries) {
+        if (entry.name.startsWith(searchPrefix)) {
+          completions.push({
+            label: entry.name,
+            kind: entry.isDirectory()
+              ? LSP.CompletionItemKind.Folder
+              : LSP.CompletionItemKind.File,
+            data: { type: CompletionItemDataType.Symbol },
+            insertText: entry.name.slice(searchPrefix.length),
+          })
+        }
+      }
+      return completions
+    } catch {
+      return []
+    }
   }
 }
 

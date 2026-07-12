@@ -1,6 +1,7 @@
 import * as fs from 'fs'
 import * as FuzzySearch from 'fuzzy-search'
 import fetch from 'node-fetch'
+import * as path from 'path'
 import * as url from 'url'
 import { isDeepStrictEqual } from 'util'
 import * as LSP from 'vscode-languageserver/node'
@@ -8,6 +9,7 @@ import { TextDocument } from 'vscode-languageserver-textdocument'
 import * as Parser from 'web-tree-sitter'
 
 import { flattenArray } from './util/array'
+import { parseBashIdeDirectives } from './util/bash-ide-directives'
 import {
   FindDeclarationParams,
   findDeclarationUsingGlobalSemantics,
@@ -17,12 +19,19 @@ import {
   getLocalDeclarations,
   GlobalDeclarations,
 } from './util/declarations'
+import {
+  FlowAnalyzer,
+  FlowAnalysisContext,
+  InlayHint,
+} from './util/flow-analysis'
+import { FlowBindings, tryGetConcreteValues, tryGetSingleValue } from './util/flow-value'
 import { getFilePaths } from './util/fs'
 import { logger } from './util/logger'
 import { isPositionIncludedInRange } from './util/lsp'
 import { analyzeFile } from './util/shebang'
 import * as sourcing from './util/sourcing'
 import * as TreeSitterUtil from './util/tree-sitter'
+import { Config } from './config'
 
 type AnalyzedDocument = {
   document: TextDocument
@@ -30,6 +39,12 @@ type AnalyzedDocument = {
   sourcedUris: Set<string>
   sourceCommands: sourcing.SourceCommand[]
   tree: Parser.Tree
+  /** Flow analysis bindings after analysis. */
+  flowBindings?: FlowBindings
+  /** Inlay hints from flow analysis. */
+  inlayHints?: InlayHint[]
+  /** Dimmed ranges from constexpr branch evaluation. */
+  dimmedRanges?: LSP.Range[]
 }
 
 /**
@@ -37,11 +52,14 @@ type AnalyzedDocument = {
  * tree-sitter to find definitions, reference, etc.
  */
 export default class Analyzer {
+  private config: Config | null = null
   private enableSourceErrorDiagnostics: boolean
   private includeAllWorkspaceSymbols: boolean
   private parser: Parser
   private uriToAnalyzedDocument: Record<string, AnalyzedDocument | undefined> = {}
   private workspaceFolder: string | null
+  /** Cached flow analysis results for sourced files. */
+  private uriToFlowBindings: Map<string, FlowBindings> = new Map()
 
   public constructor({
     enableSourceErrorDiagnostics = false,
@@ -58,6 +76,11 @@ export default class Analyzer {
     this.includeAllWorkspaceSymbols = includeAllWorkspaceSymbols
     this.parser = parser
     this.workspaceFolder = workspaceFolder
+  }
+
+  /** Set the configuration for flow analysis. */
+  public setConfig(config: Config): void {
+    this.config = config
   }
 
   /**
@@ -90,13 +113,24 @@ export default class Analyzer {
         .filter((uri): uri is string => uri !== null),
     )
 
-    this.uriToAnalyzedDocument[uri] = {
+    const analyzedDoc: AnalyzedDocument = {
       document,
       globalDeclarations,
       sourcedUris,
       sourceCommands: sourceCommands.filter((sourceCommand) => !sourceCommand.error),
       tree,
     }
+
+    // Run flow analysis if enabled
+    if (this.config?.enableFlowAnalysis && tree.rootNode) {
+      try {
+        this.runFlowAnalysis(analyzedDoc, uri, fileContent)
+      } catch (err) {
+        logger.warn(`Flow analysis failed for ${uri}: ${err}`)
+      }
+    }
+
+    this.uriToAnalyzedDocument[uri] = analyzedDoc
 
     if (!this.includeAllWorkspaceSymbols) {
       sourceCommands
@@ -133,6 +167,198 @@ export default class Analyzer {
     }
 
     return diagnostics
+  }
+
+  /**
+   * Run flow-sensitive analysis on a document.
+   */
+  private runFlowAnalysis(
+    analyzedDoc: AnalyzedDocument,
+    uri: string,
+    fileContent: string,
+  ): void {
+    if (!this.config) return
+
+    const { pathEnvInit, seedVariables } = this.config
+
+    // Determine CWD for this file
+    let cwd = path.dirname(uri.replace('file://', ''))
+
+    // Parse bash-ide directives
+    const bashIde = parseBashIdeDirectives(fileContent)
+    const cwdDirective = bashIde.directives.find((d) => d.type === 'cwd')
+    if (cwdDirective?.value) {
+      cwd = cwdDirective.value
+      if (!path.isAbsolute(cwd)) {
+        cwd = path.resolve(path.dirname(uri.replace('file://', '')), cwd)
+      }
+    }
+
+    const sourcePushd = bashIde.directives.some((d) => d.type === 'source-pushd')
+
+    // Check pathEnvInit rules
+    const filePath = uri.replace('file://', '')
+    for (const rule of pathEnvInit) {
+      const globRegex = new RegExp(
+        '^' + rule.path.replace(/\./g, '\\.').replace(/\*/g, '(.*)') + '$'
+      )
+      const match = filePath.match(globRegex)
+      if (match) {
+        if (rule.sourcePushd) {
+          // sourcePushd-only rule applies additively
+        }
+      }
+    }
+
+    // Build initial bindings from seedVariables
+    const initialBindings: FlowBindings = new Map()
+    for (const [varName, value] of Object.entries(seedVariables)) {
+      initialBindings.set(varName, {
+        kind: 'concrete' as const,
+        values: [{ text: value, origin: 'seed' as const }],
+      })
+    }
+
+    // Handle env-init directives
+    const envInit = bashIde.directives.find((d) => d.type === 'env-init')
+    if (envInit?.value) {
+      // Process the env-init command
+      const assignments = this.extractAssignmentsFromEnvInit(envInit.value)
+      for (const [varName, value] of assignments) {
+        initialBindings.set(varName, {
+          kind: 'concrete' as const,
+          values: [{ text: value, origin: 'env-init' as const }],
+        })
+      }
+    }
+
+    // Handle env-init blocks
+    for (const block of bashIde.envInitBlocks) {
+      for (const cmd of block.commands) {
+        const assignments = this.extractAssignmentsFromEnvInit(cmd)
+        for (const [varName, value] of assignments) {
+          initialBindings.set(varName, {
+            kind: 'concrete' as const,
+            values: [{ text: value, origin: 'env-init' as const }],
+          })
+        }
+      }
+    }
+
+    // Apply pathEnvInit rules
+    for (const rule of pathEnvInit) {
+      const globRegex = new RegExp(
+        '^' + rule.path.replace(/\./g, '\\.').replace(/\*/g, '(.*)') + '$'
+      )
+      const match = filePath.match(globRegex)
+      if (match) {
+        // Seed variables with capture group expansion
+        if (rule.variables) {
+          for (const [varName, valueTemplate] of Object.entries(rule.variables)) {
+            const expanded = valueTemplate.replace(/\$(\d+)/g, (_, n) => match[parseInt(n)] || '')
+            initialBindings.set(varName, {
+              kind: 'concrete' as const,
+              values: [{ text: expanded, origin: 'seed' as const }],
+            })
+          }
+        }
+      }
+    }
+
+    const ctx: FlowAnalysisContext = {
+      uri,
+      content: fileContent,
+      rootNode: analyzedDoc.tree.rootNode,
+      cwd,
+      initialBindings,
+      sourcePushd,
+      resolveSource: (sourcePath: string, fromUri: string) => {
+        // Resolve source paths using the analyzer
+        return sourcePath
+      },
+      analyzeSourcedFile: (sourcedUri: string): FlowBindings => {
+        // Check cache first
+        const cached = this.uriToFlowBindings.get(sourcedUri)
+        if (cached) return cached
+
+        // Try to load and analyze the sourced file
+        try {
+          const filePath = sourcedUri.replace('file://', '')
+          if (!fs.existsSync(filePath)) return new Map()
+
+          const content = fs.readFileSync(filePath, 'utf8')
+          const sourcedTree = this.parser.parse(content)
+
+          const sourcedCtx: FlowAnalysisContext = {
+            ...ctx,
+            uri: sourcedUri,
+            content,
+            rootNode: sourcedTree.rootNode,
+            cwd: sourcePushd ? path.dirname(filePath) : ctx.cwd,
+            inlayHints: [],
+            dimmedRanges: [],
+          }
+
+          // Run flow analysis on the sourced file recursively
+          const sourcedBindings = FlowAnalyzer.analyzeFile(sourcedCtx)
+          this.uriToFlowBindings.set(sourcedUri, sourcedBindings)
+          return sourcedBindings
+        } catch {
+          return new Map()
+        }
+      },
+      trackInlayHints: true,
+      inlayHints: [],
+      dimmedRanges: [],
+    }
+
+    // Run the flow analysis
+    const flowBindings = FlowAnalyzer.analyzeFile(ctx)
+
+    // Store results
+    analyzedDoc.flowBindings = flowBindings
+    analyzedDoc.inlayHints = ctx.inlayHints
+    analyzedDoc.dimmedRanges = ctx.dimmedRanges
+
+    // Also cache
+    this.uriToFlowBindings.set(uri, flowBindings)
+  }
+
+  /**
+   * Extract variable assignments from an env-init command string.
+   */
+  private extractAssignmentsFromEnvInit(command: string): Map<string, string> {
+    const assignments = new Map<string, string>()
+
+    // Match VAR=value (possibly quoted)
+    const assignmentRegex = /(?:^|\s+)(?:export\s+)?(\w+)=(["']?)([^"'\s]*)\2(?:\s+|$)/g
+    let match: RegExpExecArray | null
+    while ((match = assignmentRegex.exec(command)) !== null) {
+      assignments.set(match[1], match[3])
+    }
+
+    return assignments
+  }
+
+  /**
+   * Get inlay hints for a document.
+   */
+  public getInlayHints(uri: string): InlayHint[] {
+    return this.uriToAnalyzedDocument[uri]?.inlayHints || []
+  }
+
+  /**
+   * Get dimmed ranges for a document (untaken constexpr branches).
+   */
+  public getDimmedRanges(uri: string): LSP.Range[] {
+    return this.uriToAnalyzedDocument[uri]?.dimmedRanges || []
+  }
+
+  /**
+   * Get flow-resolved variable values for a document.
+   */
+  public getFlowBindings(uri: string): FlowBindings | undefined {
+    return this.uriToAnalyzedDocument[uri]?.flowBindings
   }
 
   /**

@@ -16,10 +16,15 @@ Documentation around configuration variables can be found in the [config.ts](htt
 - Workspace symbols
 - Rename symbol
 - Format document
+- **Flow-sensitive variable resolution** — resolve variable values through control flow (arithmetic, parameter expansion, constant `if`/`case` branch evaluation), displayed as inlay hints
+- **Branch dimming** — dims untaken `if`/`else`/`elif` and `case` branches when the condition evaluates to a constant
+- **Dynamic source resolution** — resolve `source`/`.` paths using flow-resolved variables, with ShellCheck directives (`source=`, `source-fallback=`, `source-path=`) and `# bash-ide` directives
+- **Path completions** inside `shellcheck source=` and `source-fallback=` comment directives
 
 To be implemented:
 
 - Better jump to declaration and find references based on scope
+- Full interprocedural flow analysis (function call resolution)
 
 ## Installation
 
@@ -200,6 +205,98 @@ properties are read from `.editorconfig` - indentation preferences are still pro
 so to format using the indentation specified in `.editorconfig` make sure your editor is also
 configured to read `.editorconfig`. It is possible to disable `.editorconfig` support and always use
 the language server config by setting the "Ignore Editorconfig" configuration variable.
+
+## Flow Analysis
+
+When enabled via `bashIde.enableFlowAnalysis: true`, the server runs a flow-sensitive analysis
+engine that resolves variable values through control flow. Results are shown as **inlay hints**
+after assignments, and untaken `if`/`else`/`case` branches are **dimmed** (shown as hint-level
+diagnostics).
+
+### What Gets Resolved
+
+- **Arithmetic expressions**: `$((x + 1))` and `((x++))` are evaluated when operand values are known
+- **Parameter expansion**: `${VAR:-default}`, `${VAR:=assign}`, and the `: "${VAR:=default}"` pattern are resolved
+- **Constant branch evaluation**: `if [[ $KNOWN -eq 1 ]]`, `case $VERSION in ...`, and `while`/`until` conditions are evaluated when values are known
+- **Live PWD tracking**: `cd`, `pushd`, and `popd` commands update the working directory for relative path resolution
+- **Dynamic source resolution**: `source` and `.` commands resolve paths using flow-resolved variables
+
+### `# bash-ide` Directives
+
+Place these comments in your shell scripts to control flow analysis behavior:
+
+```bash
+# Set the working directory for relative path resolution and source commands
+# bash-ide cwd=/path/to/project
+
+# Run a setup command before analysis (its variable assignments and exports are injected)
+# bash-ide env-init=source /opt/sdk/env.sh
+
+# Multi-line env-init block
+# bash-ide env-init-begin
+source /opt/sdk/env.sh
+export CUSTOM_VAR="hello"
+# bash-ide env-init-end
+
+# Auto-set PWD to a sourced file's own directory, so relative references inside it resolve
+# bash-ide source-pushd
+source ./lib/helpers.sh
+```
+
+### ShellCheck Source Directives
+
+For source commands whose path can't be statically determined, ShellCheck directives provide
+explicit or fallback paths. **Path completions** are offered inside `source=` and `source-fallback=`
+values:
+
+```bash
+# shellcheck source=/explicit/path/to/file.sh
+source "$DYNAMIC_PATH"
+
+# shellcheck source-fallback=/fallback/path.sh  (used when dynamic resolution fails)
+source "$MAYBE_UNDEFINED"
+
+# shellcheck source-path=my_scripts  (search root for resolving relative paths)
+source "my_helper.sh"
+
+# shellcheck source=/dev/null  (suppress the error entirely)
+source "$UNKNOWN"
+```
+
+### Configuration
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `bashIde.enableFlowAnalysis` | `boolean` | `false` | Enable flow-sensitive analysis, inlay hints, branch dimming, and dynamic source resolution |
+| `bashIde.seedVariables` | `object` | `{}` | Pre-seeded `{ VAR: value }` map for variables not in the server environment but needed for path resolution |
+| `bashIde.pathEnvInit` | `array` | `[]` | Path-based env init rules (see below) |
+
+#### `pathEnvInit` Rules
+
+An array of rules triggered when a file path matches a glob pattern. `(*)` in the pattern creates
+capture groups referenced as `$1`, `$2`, etc. in `variables` and `envInit`:
+
+```jsonc
+{
+  "bashIde.pathEnvInit": [
+    {
+      // Glob pattern with (*) capture groups
+      "path": "projects/(*)/scripts/(*).sh",
+      // Variables seeded with captured values ($1, $2, etc. are capture groups)
+      "variables": { "PROJECT": "$1", "SCRIPT_NAME": "$2" },
+      // Command run before analysis (supports $1/$2 expansion)
+      "envInit": "source /opt/$1/env.sh",
+      // Auto-set PWD to sourced file directories
+      "sourcePushd": true
+    },
+    {
+      // sourcePushd-only rules apply additively
+      "path": "libs/(*)/**/*.sh",
+      "sourcePushd": true
+    }
+  ]
+}
+```
 
 ## Logging
 

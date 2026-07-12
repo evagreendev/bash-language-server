@@ -6,11 +6,14 @@ describe('ConfigSchema', () => {
     expect(ConfigSchema.parse({})).toMatchInlineSnapshot(`
       {
         "backgroundAnalysisMaxFiles": 500,
+        "enableFlowAnalysis": false,
         "enableSourceErrorDiagnostics": false,
         "explainshellEndpoint": "",
         "globPattern": "**/*@(.sh|.inc|.bash|.command)",
         "includeAllWorkspaceSymbols": false,
         "logLevel": "info",
+        "pathEnvInit": [],
+        "seedVariables": {},
         "shellcheckArguments": [],
         "shellcheckExternalSources": true,
         "shellcheckPath": "shellcheck",
@@ -52,11 +55,14 @@ describe('ConfigSchema', () => {
     ).toMatchInlineSnapshot(`
       {
         "backgroundAnalysisMaxFiles": 1,
+        "enableFlowAnalysis": false,
         "enableSourceErrorDiagnostics": false,
         "explainshellEndpoint": "localhost:8080",
         "globPattern": "**/*@(.sh)",
         "includeAllWorkspaceSymbols": true,
         "logLevel": "info",
+        "pathEnvInit": [],
+        "seedVariables": {},
         "shellcheckArguments": [
           "-e",
           "SC2001",
@@ -95,11 +101,14 @@ describe('getConfigFromEnvironmentVariables', () => {
     expect(config).toMatchInlineSnapshot(`
       {
         "backgroundAnalysisMaxFiles": 500,
+        "enableFlowAnalysis": false,
         "enableSourceErrorDiagnostics": false,
         "explainshellEndpoint": "",
         "globPattern": "**/*@(.sh|.inc|.bash|.command)",
         "includeAllWorkspaceSymbols": false,
         "logLevel": "info",
+        "pathEnvInit": [],
+        "seedVariables": {},
         "shellcheckArguments": [],
         "shellcheckExternalSources": true,
         "shellcheckPath": "shellcheck",
@@ -127,11 +136,14 @@ describe('getConfigFromEnvironmentVariables', () => {
     expect(config).toMatchInlineSnapshot(`
       {
         "backgroundAnalysisMaxFiles": 500,
+        "enableFlowAnalysis": false,
         "enableSourceErrorDiagnostics": false,
         "explainshellEndpoint": "",
         "globPattern": "**/*@(.sh|.inc|.bash|.command)",
         "includeAllWorkspaceSymbols": false,
         "logLevel": "info",
+        "pathEnvInit": [],
+        "seedVariables": {},
         "shellcheckArguments": [],
         "shellcheckExternalSources": true,
         "shellcheckPath": "",
@@ -165,11 +177,14 @@ describe('getConfigFromEnvironmentVariables', () => {
     expect(config).toMatchInlineSnapshot(`
       {
         "backgroundAnalysisMaxFiles": 1,
+        "enableFlowAnalysis": false,
         "enableSourceErrorDiagnostics": false,
         "explainshellEndpoint": "localhost:8080",
         "globPattern": "*.*",
         "includeAllWorkspaceSymbols": false,
         "logLevel": "error",
+        "pathEnvInit": [],
+        "seedVariables": {},
         "shellcheckArguments": [
           "-e",
           "SC2001",

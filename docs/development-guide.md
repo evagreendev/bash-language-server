@@ -3,9 +3,16 @@
 There are two moving parts.
 
 - **Server**: A node server written in Typescript that implements the
-  [Language Server Protocol (LSP)][lsp].
+  [Language Server Protocol (LSP)][lsp]. Key modules:
+  - `server/src/analyser.ts` — AST analysis, declaration finding, reference lookup
+  - `server/src/server.ts` — LSP protocol handlers (completion, hover, inlay hints, etc.)
+  - `server/src/util/flow-analysis.ts` — flow-sensitive variable resolution and constant branch evaluation
+  - `server/src/util/flow-value.ts` — flow-value lattice types for the analysis engine
+  - `server/src/util/bash-ide-directives.ts` — parser for `# bash-ide` directive comments
+  - `server/src/util/sourcing.ts` — source/`.` command resolution with ShellCheck directives
+  - `server/src/config.ts` — configuration schema and defaults
 
-**Client**: A Visual Studio Code (vscode) extension which wraps the LSP server.
+- **Client**: A Visual Studio Code (vscode) extension which wraps the LSP server.
 
 The project has a root `package.json` file which is really just there for
 convenience - it proxies to the `package.json` files in the `vscode-client` and

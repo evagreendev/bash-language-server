@@ -7,7 +7,12 @@ const defaultConfig = getDefaultConfiguration()
 function flattenObjectKeys(obj: Record<string, any>, prefix = '') {
   return Object.keys(obj).reduce((flattenedKeys: string[], key) => {
     const pre = prefix.length ? `${prefix}.` : ''
-    if (typeof obj[key] === 'object' && obj[key] !== null && !Array.isArray(obj[key])) {
+    if (
+      typeof obj[key] === 'object' &&
+      obj[key] !== null &&
+      !Array.isArray(obj[key]) &&
+      Object.keys(obj[key]).length > 0
+    ) {
       flattenedKeys.push(...flattenObjectKeys(obj[key], pre + key))
     } else {
       flattenedKeys.push(pre + key)
