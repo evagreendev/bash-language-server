@@ -362,6 +362,13 @@ export default class Analyzer {
   }
 
   /**
+   * Get the tree-sitter root node for a document (for semantic tokens etc.).
+   */
+  public getRootNode(uri: string): Parser.SyntaxNode | undefined {
+    return this.uriToAnalyzedDocument[uri]?.tree?.rootNode
+  }
+
+  /**
    * Initiates a background analysis of the files in the workspaceFolder to
    * enable features across files.
    *
@@ -827,6 +834,29 @@ export default class Analyzer {
   }
 
   /**
+   * If the position is within a concatenation node, return the full
+   * concatenation text (used for path resolution with $VAR expansion).
+   */
+  public getConcatenationTextAtPoint(
+    uri: string,
+    line: number,
+    column: number,
+  ): string | null {
+    const node = this.nodeAtPoint(uri, line, column)
+    if (!node) return null
+
+    // Walk up to find a concatenation ancestor
+    let current: Parser.SyntaxNode | null = node
+    while (current) {
+      if (current.type === 'concatenation') {
+        return current.text
+      }
+      current = current.parent
+    }
+    return null
+  }
+
+  /**
    * Get the document for the given URI.
    */
   public getDocument(uri: string): TextDocument | undefined {
@@ -980,6 +1010,18 @@ export default class Analyzer {
     }
 
     return node.text.trim()
+  }
+
+  /**
+   * Get the start column of the word at the given point.
+   * Returns -1 if no word is found.
+   */
+  public wordStartColumnAtPoint(uri: string, line: number, column: number): number {
+    const node = this.nodeAtPoint(uri, line, column)
+    if (!node || node.childCount > 0 || node.text.trim() === '') {
+      return -1
+    }
+    return node.startPosition.column
   }
 
   public wordAtPointFromTextPosition(

@@ -156,6 +156,67 @@ export function isFilePathContext(word: string): boolean {
 }
 
 /**
+ * Try to resolve a path string by expanding $VAR and ${VAR} references
+ * using environment variables from process.env.
+ *
+ * Also handles concatenation patterns like "$HOME"/.local/ —
+ * stripping quotes from string parts and joining with unquoted parts.
+ */
+export function resolvePathWithEnv(pathStr: string): string {
+  let result = ''
+  let i = 0
+
+  while (i < pathStr.length) {
+    if (pathStr[i] === '"' || pathStr[i] === "'") {
+      // Quoted section: extract content, expand vars, skip the quotes
+      const quote = pathStr[i]
+      i++ // skip opening quote
+      let content = ''
+      while (i < pathStr.length && pathStr[i] !== quote) {
+        content += pathStr[i]
+        i++
+      }
+      if (i < pathStr.length) i++ // skip closing quote
+      // Expand variables inside the quoted content
+      result += expandEnvVars(content)
+    } else {
+      result += pathStr[i]
+      i++
+    }
+  }
+
+  // Also expand any remaining unquoted $VAR references in the full result
+  return expandEnvVars(result)
+}
+
+/** Expand $VAR and ${VAR} patterns using process.env. */
+function expandEnvVars(s: string): string {
+  return s
+    .replace(/\$\{(\w+)\}/g, (_, name) => process.env[name] || '')
+    .replace(/\$(\w+)/g, (_, name) => process.env[name] || '')
+}
+
+/**
+ * Given a concatenation text like '"$HOME"/.local/', resolve the full
+ * path by expanding environment variables and stripping quotes.
+ * Returns the resolved absolute path, or null if it can't be resolved.
+ */
+export function resolveConcatenationPath(concatText: string): string | null {
+  // Split concatenation into parts: quoted strings, unquoted words
+  // e.g. '"$HOME"/.local/' -> expand $HOME, join with /.local/
+  const resolved = resolvePathWithEnv(concatText)
+  if (!resolved) return null
+
+  // Expand tilde
+  if (resolved.startsWith('~')) {
+    const home = process.env.HOME || '/root'
+    return home + resolved.slice(1)
+  }
+
+  return resolved
+}
+
+/**
  * Determine the search directory for a file path completion.
  */
 export function getSearchDirForPath(

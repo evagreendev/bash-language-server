@@ -39,6 +39,7 @@ export const FIXTURE_URI = {
   SOURCING2: `file://${path.join(FIXTURE_FOLDER, 'sourcing2.sh')}`,
   RENAMING: `file://${path.join(FIXTURE_FOLDER, 'renaming.sh')}`,
   RENAMING_READ: `file://${path.join(FIXTURE_FOLDER, 'renaming-read.sh')}`,
+  PATH_COMPLETION: `file://${path.join(FIXTURE_FOLDER, 'path-completion.sh')}`,
 }
 
 export const FIXTURE_DOCUMENT: Record<FIXTURE_KEY, TextDocument> = (

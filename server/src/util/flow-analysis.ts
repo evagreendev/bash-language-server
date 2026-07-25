@@ -205,6 +205,35 @@ export class FlowAnalyzer {
   }
 
   /**
+   * Returns true if a value node produces a non-obvious result worth hinting.
+   * Skips trivial literals: VAR=hello, VAR="text", VAR=5, ARR=(a b).
+   * Keeps hints for expansions, concatenations, arithmetic, command substitutions.
+   */
+  private static isNonTrivialValue(valueNode: SyntaxNode | null | undefined): boolean {
+    if (!valueNode) return false
+    switch (valueNode.type) {
+      case 'word':
+      case 'number':
+      case 'raw_string':
+        return false
+      case 'string':
+        // Trivial if all children are string_content (no expansions)
+        return valueNode.namedChildren.length > 0 &&
+          !valueNode.namedChildren.every(c => c.type === 'string_content')
+      case 'array':
+        return false
+      case 'expansion':
+      case 'simple_expansion':
+      case 'concatenation':
+      case 'arithmetic_expansion':
+      case 'command_substitution':
+        return true
+      default:
+        return true
+    }
+  }
+
+  /**
    * Analyze a variable assignment and update bindings.
    */
   private static analyzeAssignment(
@@ -218,7 +247,7 @@ export class FlowAnalyzer {
     const varName = varNameNode.text
 
     // Check if this is an array element assignment like ARR[0]=value
-    const subscriptNode = node.descendantsOfType('subscript')[0]
+    const subscriptNode = node.namedChildren.find(c => c.type === 'subscript')
     if (subscriptNode) {
       // Extract the index from the subscript's children (skip variable_name)
       const idxNode = subscriptNode.namedChildren.find(c => c.type !== 'variable_name')
@@ -244,7 +273,7 @@ export class FlowAnalyzer {
           elements[idx] = val
           bindings.set(varName, concreteArray(elements))
 
-          if (ctx.trackInlayHints) {
+          if (ctx.trackInlayHints && FlowAnalyzer.isNonTrivialValue(subValueNode)) {
             const hintLabel = formatFlowValue(concreteArray(elements))
             if (hintLabel) {
               ctx.inlayHints.push({
@@ -303,6 +332,7 @@ export class FlowAnalyzer {
       }
 
       if (ctx.trackInlayHints) {
+        // += always shows the combined result, which is non-obvious
         const newBinding = bindings.get(varName)
         const hintLabel = newBinding ? formatFlowValue(newBinding) : null
         if (hintLabel) {
@@ -322,7 +352,7 @@ export class FlowAnalyzer {
       const elements = FlowAnalyzer.extractArrayElements(valueNode, bindings)
       bindings.set(varName, concreteArray(elements))
 
-      if (ctx.trackInlayHints) {
+      if (ctx.trackInlayHints && FlowAnalyzer.isNonTrivialValue(valueNode)) {
         const hintLabel = formatFlowValue(concreteArray(elements))
         if (hintLabel) {
           ctx.inlayHints.push({
@@ -341,8 +371,8 @@ export class FlowAnalyzer {
     if (flowValue.success && flowValue.value) {
       bindings.set(varName, flowValue.value)
 
-      // Track inlay hint
-      if (ctx.trackInlayHints) {
+      // Track inlay hint (only for non-trivial values like expansions, arithmetic, etc.)
+      if (ctx.trackInlayHints && FlowAnalyzer.isNonTrivialValue(valueNode)) {
         const hintLabel = formatFlowValue(flowValue.value)
         if (hintLabel) {
           ctx.inlayHints.push({
@@ -364,19 +394,55 @@ export class FlowAnalyzer {
 
   /**
    * Analyze a declaration command (local, declare, typeset, export, readonly).
+   * Handles flags: -n (nameref), -A (assoc array), -i (integer), -a (indexed array).
    */
   private static analyzeDeclarationCommand(
     node: SyntaxNode,
     bindings: FlowBindings,
     ctx: FlowAnalysisContext,
   ): void {
+    // Detect flags: -n, -A, -i, -a, -r, -x, -g, -l, etc.
+    let isNameref = false
+    let isAssocArray = false
+
+    for (const child of node.children) {
+      if (child.type === 'word' && child.text.startsWith('-')) {
+        for (const ch of child.text) {
+          if (ch === 'n') isNameref = true
+          if (ch === 'A') isAssocArray = true
+        }
+      }
+    }
+
     // Treat like a variable assignment for the variables declared
     for (const child of node.namedChildren) {
       if (child.type === 'variable_assignment') {
-        FlowAnalyzer.analyzeAssignment(child, bindings, ctx)
+        if (isNameref) {
+          // Nameref: the variable is an alias for another variable.
+          // Conservative: mark as unknown since tracking aliases requires
+          // inter-procedural analysis.
+          const varNameNode = child.descendantsOfType('variable_name')[0]
+          if (varNameNode) {
+            bindings.set(varNameNode.text, unknown())
+          }
+        } else if (isAssocArray) {
+          // Associative array: mark as unknown for now.
+          const varNameNode = child.descendantsOfType('variable_name')[0]
+          if (varNameNode) {
+            bindings.set(varNameNode.text, unknown())
+          }
+        } else {
+          FlowAnalyzer.analyzeAssignment(child, bindings, ctx)
+        }
       } else if (child.type === 'variable_name') {
         // Bare name without assignment — just mark as existing but unknown
-        bindings.set(child.text, unknown())
+        if (isNameref) {
+          bindings.set(child.text, unknown())
+        } else if (isAssocArray) {
+          bindings.set(child.text, unknown())
+        } else {
+          bindings.set(child.text, unknown())
+        }
       }
     }
   }
@@ -434,6 +500,29 @@ export class FlowAnalyzer {
         for (const child of node.namedChildren) {
           if (child.type === 'variable_assignment') {
             FlowAnalyzer.analyzeAssignment(child, bindings, ctx)
+          }
+        }
+        break
+      }
+      case 'unset': {
+        // Remove variable(s) from bindings
+        for (const arg of args) {
+          if (arg.type === 'word') {
+            bindings.delete(arg.text)
+          } else if (arg.type === 'variable_name') {
+            bindings.delete(arg.text)
+          }
+        }
+        break
+      }
+      case 'read': {
+        // read VAR1 VAR2 ... — variables receive unknown values from stdin
+        // Skip flag arguments (starting with -)
+        for (const arg of args) {
+          if (arg.type === 'word' && !arg.text.startsWith('-')) {
+            bindings.set(arg.text, unknown())
+          } else if (arg.type === 'variable_name') {
+            bindings.set(arg.text, unknown())
           }
         }
         break
@@ -662,8 +751,8 @@ export class FlowAnalyzer {
     ctx: FlowAnalysisContext,
     state: { pwd: string },
   ): void {
-    // Find condition
-    const conditionNode = node.children.find(c =>
+    // Find condition: first named child that is test_command, command, or bracket_expression
+    const conditionNode = node.namedChildren.find(c =>
       ['test_command', 'bracket_expression', 'command', 'word'].includes(c.type)
     )
 
@@ -671,52 +760,56 @@ export class FlowAnalyzer {
       ? FlowAnalyzer.evaluateCondition(conditionNode, bindings, ctx)
       : { success: false }
 
-    // Find the if body (the first command or compound_statement after 'then')
-    const thenIdx = node.children.findIndex(c => c.type === 'then')
-    let thenBody: SyntaxNode | null = null
+    // Find the 'then' keyword index in all children
+    const thenIdx = node.children.findIndex(
+      c => !c.isNamed && c.type === 'then'
+    )
+
+    // Collect then-body named children: those after 'then' and before elif/else/fi
+    const thenBodyNodes: SyntaxNode[] = []
+    const elifClauses: SyntaxNode[] = []
+    const elseClauses: SyntaxNode[] = []
+
     if (thenIdx >= 0) {
-      for (let i = thenIdx + 1; i < node.children.length; i++) {
-        const c = node.children[i]
-        if (c.type === 'command' || c.type === 'compound_statement' || c.type === 'subshell') {
-          thenBody = c
-          break
+      for (const child of node.namedChildren) {
+        const childStartIdx = child.startIndex
+        const thenStartIdx = node.children[thenIdx].startIndex
+        if (childStartIdx <= thenStartIdx) continue
+        if (child.type === 'elif_clause') {
+          elifClauses.push(child)
+        } else if (child.type === 'else_clause') {
+          elseClauses.push(child)
+        } else {
+          thenBodyNodes.push(child)
         }
       }
     }
 
-    // Find else/elif clauses — track position relative to 'then' keyword
-    const thenChildIdx = node.children.findIndex(c => c.type === 'then')
-    const elseClauses: { condition: SyntaxNode | null; body: SyntaxNode | null }[] = []
-    for (const child of node.children) {
-      const childIdx = node.children.indexOf(child)
-      if (childIdx <= thenChildIdx) continue
-      if (child.type === 'elif_clause') {
-        const elifCondition = child.children.find(c =>
-          c.type === 'test_command' || c.type === 'bracket_expression' || c.type === 'command'
-        )
-        const elifBody = child.children.find(c =>
-          c.type === 'command' || c.type === 'compound_statement' || c.type === 'subshell'
-        )
-        elseClauses.push({ condition: elifCondition || null, body: elifBody || null })
-      } else if (child.type === 'else_clause') {
-        const elseBody = child.children.find(c =>
-          c.type === 'command' || c.type === 'compound_statement' || c.type === 'subshell'
-        )
-        elseClauses.push({ condition: null, body: elseBody || null })
+    // Helper: analyze a list of body nodes
+    const analyzeBodyNodes = (bodyNodes: SyntaxNode[], b: FlowBindings) => {
+      for (const bodyNode of bodyNodes) {
+        FlowAnalyzer.analyzeNode(bodyNode, b, ctx, state)
       }
     }
 
-    // If condition is constant truthy, only analyze then branch, dim the rest
-    if (evalResult.success && evalResult.isConstTruthy && thenBody) {
-      // Analyze then body
-      FlowAnalyzer.analyzeNode(thenBody, bindings, ctx, state)
+    // Helper: get range covering all body nodes
+    const bodyNodesRange = (bodyNodes: SyntaxNode[]): LSP.Range | null => {
+      if (bodyNodes.length === 0) return null
+      const first = bodyNodes[0]
+      const last = bodyNodes[bodyNodes.length - 1]
+      return LSP.Range.create(
+        first.startPosition.row, first.startPosition.column,
+        last.endPosition.row, last.endPosition.column,
+      )
+    }
 
-      // Dim untaken branches
+    // If condition is constant truthy, only analyze then branch, dim the rest
+    if (evalResult.success && evalResult.isConstTruthy && thenBodyNodes.length > 0) {
+      analyzeBodyNodes(thenBodyNodes, bindings)
+
       if (ctx.trackInlayHints) {
-        for (const clause of elseClauses) {
-          if (clause.body) {
-            ctx.dimmedRanges.push(TreeSitterUtil.range(clause.body))
-          }
+        for (const clause of [...elifClauses, ...elseClauses]) {
+          ctx.dimmedRanges.push(TreeSitterUtil.range(clause))
         }
       }
       return
@@ -724,56 +817,114 @@ export class FlowAnalyzer {
 
     // If condition is constant falsy, dim the then body, analyze else/elifs
     if (evalResult.success && evalResult.isConstFalsy) {
-      if (thenBody && ctx.trackInlayHints) {
-        ctx.dimmedRanges.push(TreeSitterUtil.range(thenBody))
+      const thenRange = bodyNodesRange(thenBodyNodes)
+      if (thenRange && ctx.trackInlayHints) {
+        ctx.dimmedRanges.push(thenRange)
       }
 
-      // Analyze else/elif branches
-      for (const clause of elseClauses) {
-        if (clause.body) {
-          if (clause.condition) {
-            // For elif, we need to evaluate its condition too
-            const elifEvalResult = FlowAnalyzer.evaluateCondition(clause.condition, bindings, ctx)
-            if (elifEvalResult.isConstFalsy && ctx.trackInlayHints) {
-              ctx.dimmedRanges.push(TreeSitterUtil.range(clause.body))
-              continue
+      // Analyze elif branches (evaluate each condition)
+      for (const elifClause of elifClauses) {
+        const elifCondition = elifClause.namedChildren.find(c =>
+          ['test_command', 'bracket_expression', 'command'].includes(c.type)
+        )
+        // Collect elif body: named children after 'then' within the elif_clause
+        const elifThenIdx = elifClause.children.findIndex(
+          c => !c.isNamed && c.type === 'then'
+        )
+        const elifBodyNodes: SyntaxNode[] = []
+        if (elifThenIdx >= 0) {
+          for (const child of elifClause.namedChildren) {
+            if (child.startIndex > elifClause.children[elifThenIdx].startIndex) {
+              elifBodyNodes.push(child)
             }
           }
-          FlowAnalyzer.analyzeNode(clause.body, bindings, ctx, state)
+        }
+
+        if (elifCondition) {
+          const elifEvalResult = FlowAnalyzer.evaluateCondition(elifCondition, bindings, ctx)
+          if (elifEvalResult.isConstFalsy) {
+            if (ctx.trackInlayHints) {
+              for (const bn of elifBodyNodes) {
+                ctx.dimmedRanges.push(TreeSitterUtil.range(bn))
+              }
+            }
+            continue
+          }
+          // Truthy elif — analyze its body
+          analyzeBodyNodes(elifBodyNodes, bindings)
+          // Also dim remaining elifs and else
+          if (ctx.trackInlayHints) {
+            const remaining = elifClauses.slice(elifClauses.indexOf(elifClause) + 1)
+            for (const c of [...remaining, ...elseClauses]) {
+              ctx.dimmedRanges.push(TreeSitterUtil.range(c))
+            }
+          }
+          return
+        }
+        // Unknown condition — analyze
+        analyzeBodyNodes(elifBodyNodes, bindings)
+      }
+
+      // Analyze else branches
+      for (const elseClause of elseClauses) {
+        for (const child of elseClause.namedChildren) {
+          FlowAnalyzer.analyzeNode(child, bindings, ctx, state)
         }
       }
       return
     }
 
     // Fallback: analyze all branches (standard path-insensitive analysis)
-    // But still try to carry discriminants into branches
     const discriminant = evalResult.success
       ? FlowAnalyzer.extractDiscriminant(conditionNode!, bindings, ctx)
       : null
 
     // Analyze then branch with discriminant
-    if (thenBody) {
+    if (thenBodyNodes.length > 0) {
       const branchBindings = new Map(bindings)
       if (discriminant) {
         FlowAnalyzer.applyDiscriminant(branchBindings, discriminant, 'positive')
       }
-      FlowAnalyzer.analyzeNode(thenBody, branchBindings, ctx, state)
-
-      // Merge branch bindings back
+      analyzeBodyNodes(thenBodyNodes, branchBindings)
       FlowAnalyzer.mergeBranchBindings(bindings, branchBindings)
     }
 
-    // Analyze else/elif branches (with negated discriminant)
-    for (const clause of elseClauses) {
-      if (clause.body) {
-        const branchBindings = new Map(bindings)
-        if (discriminant && !clause.condition) {
-          // Negate discriminant for else branch
-          FlowAnalyzer.applyDiscriminant(branchBindings, discriminant, 'negative')
+    // Analyze elif branches
+    for (const elifClause of elifClauses) {
+      const elifCondition = elifClause.namedChildren.find(c =>
+        ['test_command', 'bracket_expression', 'command'].includes(c.type)
+      )
+      const elifThenIdx = elifClause.children.findIndex(
+        c => !c.isNamed && c.type === 'then'
+      )
+      const elifBodyNodes: SyntaxNode[] = []
+      if (elifThenIdx >= 0) {
+        for (const child of elifClause.namedChildren) {
+          if (child.startIndex > elifClause.children[elifThenIdx].startIndex) {
+            elifBodyNodes.push(child)
+          }
         }
-        FlowAnalyzer.analyzeNode(clause.body, branchBindings, ctx, state)
+      }
+      if (elifBodyNodes.length > 0) {
+        const branchBindings = new Map(bindings)
+        if (discriminant && elifCondition) {
+          FlowAnalyzer.applyDiscriminant(branchBindings, discriminant, 'positive')
+        }
+        analyzeBodyNodes(elifBodyNodes, branchBindings)
         FlowAnalyzer.mergeBranchBindings(bindings, branchBindings)
       }
+    }
+
+    // Analyze else branches
+    for (const elseClause of elseClauses) {
+      const branchBindings = new Map(bindings)
+      if (discriminant) {
+        FlowAnalyzer.applyDiscriminant(branchBindings, discriminant, 'negative')
+      }
+      for (const child of elseClause.namedChildren) {
+        FlowAnalyzer.analyzeNode(child, branchBindings, ctx, state)
+      }
+      FlowAnalyzer.mergeBranchBindings(bindings, branchBindings)
     }
   }
 
@@ -786,8 +937,8 @@ export class FlowAnalyzer {
     ctx: FlowAnalysisContext,
     state: { pwd: string },
   ): void {
-    // Get the case word — the value being matched (after 'case', before 'in')
-    const caseWord = node.children.find(c =>
+    // Get the case word — the value being matched (first named child before 'in')
+    const caseWord = node.namedChildren.find(c =>
       c.type === 'word' || c.type === 'string' || c.type === 'concatenation' ||
       c.type === 'expansion' || c.type === 'simple_expansion' || c.type === 'variable_name'
     )
@@ -801,17 +952,18 @@ export class FlowAnalyzer {
     let anyMatched = false
 
     for (const item of caseItems) {
-      // The pattern is the first named child before the ')'
-      const patternNode = item.namedChildren.find(c => c.type !== 'command' && c.type !== 'compound_statement')
-      const bodyNode = item.namedChildren.find(c =>
-        c.type === 'command' || c.type === 'compound_statement' || c.type === 'subshell'
-      )
+      // The pattern is the first named child; the rest are body nodes
+      if (item.namedChildren.length < 2) continue
+      const patternNode = item.namedChildren[0]
+      const bodyNodes = item.namedChildren.slice(1)
 
-      if (patternNode && bodyNode) {
+      if (bodyNodes.length > 0) {
         const patternMatches = FlowAnalyzer.checkCasePattern(patternNode, caseValue)
 
         if (caseValue !== null && patternMatches) {
-          FlowAnalyzer.analyzeNode(bodyNode, bindings, ctx, state)
+          for (const bodyNode of bodyNodes) {
+            FlowAnalyzer.analyzeNode(bodyNode, bindings, ctx, state)
+          }
           anyMatched = true
           break
         }
@@ -826,10 +978,9 @@ export class FlowAnalyzer {
     // If the value was unknown, analyze all branches
     if (!anyMatched && caseValue === null) {
       for (const item of caseItems) {
-        const bodyNode = item.namedChildren.find(c =>
-          c.type === 'command' || c.type === 'compound_statement' || c.type === 'subshell'
-        )
-        if (bodyNode) {
+        if (item.namedChildren.length < 2) continue
+        const bodyNodes = item.namedChildren.slice(1)
+        for (const bodyNode of bodyNodes) {
           FlowAnalyzer.analyzeNode(bodyNode, bindings, ctx, state)
         }
       }
@@ -900,39 +1051,49 @@ export class FlowAnalyzer {
 
     const varName = varNode.text
 
-    // Find the body
-    const bodyNode = node.children.find(c =>
-      c.type === 'compound_statement' || c.type === 'subshell'
-    )
-    if (!bodyNode) return
+    // Find the body in do_group
+    const doGroup = node.namedChildren.find(c => c.type === 'do_group')
+    if (!doGroup) return
 
-    // Find the word list
-    const wordListNode = node.children.find(c => c.type === 'word')
-    if (wordListNode) {
-      const value = FlowAnalyzer.tryResolveValue(wordListNode, bindings)
-      if (value !== null) {
-        // Split by whitespace (simplified)
-        const parts = value.split(/\s+/).filter(Boolean)
-        if (parts.length > 0) {
-          // Analyze body with first value (first iteration)
-          // For full per-iteration, we'd analyze each value separately — simplified here
-          const bodyBindings = new Map(bindings)
-          bodyBindings.set(varName, concrete(parts[0]))
-          FlowAnalyzer.analyzeNode(bodyNode, bodyBindings, ctx, state)
-          // Merge back — for now, set var to union of all iteration values
-          bindings.set(varName, {
-            kind: 'concrete',
-            values: parts.map(p => ({ text: p, origin: 'assignment' as const })),
-          })
-          return
+    // Collect word list items: all 'word' named children before the do_group
+    const words: string[] = []
+    for (const child of node.namedChildren) {
+      if (child.type === 'do_group') break
+      if (child.type === 'word') {
+        const val = FlowAnalyzer.tryResolveValue(child, bindings)
+        if (val !== null) {
+          words.push(val)
+        } else {
+          words.push(child.text)
         }
       }
     }
 
+    if (words.length > 0) {
+      // Analyze body with first value (first iteration)
+      // Side effects must merge back (bash for loops don't create subshells)
+      const bodyBindings = new Map(bindings)
+      bodyBindings.set(varName, concrete(words[0]))
+      for (const child of doGroup.namedChildren) {
+        FlowAnalyzer.analyzeNode(child, bodyBindings, ctx, state)
+      }
+      // Merge body side effects back into parent bindings
+      FlowAnalyzer.mergeBranchBindings(bindings, bodyBindings)
+      // Set var to union of all iteration values
+      bindings.set(varName, {
+        kind: 'concrete',
+        values: words.map(p => ({ text: p, origin: 'assignment' as const })),
+      })
+      return
+    }
+
     // Unknown — analyze body with unknown
-    const bodyBindings = new Map(bindings)
-    bodyBindings.set(varName, unknown())
-    FlowAnalyzer.analyzeNode(bodyNode, bodyBindings, ctx, state)
+    const bodyBindings2 = new Map(bindings)
+    bodyBindings2.set(varName, unknown())
+    for (const child of doGroup.namedChildren) {
+      FlowAnalyzer.analyzeNode(child, bodyBindings2, ctx, state)
+    }
+    FlowAnalyzer.mergeBranchBindings(bindings, bodyBindings2)
     bindings.set(varName, unknown())
   }
 
@@ -945,14 +1106,12 @@ export class FlowAnalyzer {
     ctx: FlowAnalysisContext,
     state: { pwd: string },
   ): void {
-    const conditionNode = node.children.find(c =>
+    const conditionNode = node.namedChildren.find(c =>
       ['test_command', 'bracket_expression', 'command', 'word'].includes(c.type)
     )
 
-    const bodyNode = node.children.find(c =>
-      c.type === 'compound_statement' || c.type === 'subshell'
-    )
-    if (!bodyNode) return
+    const doGroup = node.namedChildren.find(c => c.type === 'do_group')
+    if (!doGroup) return
 
     // Evaluate condition
     if (conditionNode) {
@@ -964,20 +1123,24 @@ export class FlowAnalyzer {
 
         if (shouldRun === false && ctx.trackInlayHints) {
           // Never executes — dim the body
-          ctx.dimmedRanges.push(TreeSitterUtil.range(bodyNode))
+          ctx.dimmedRanges.push(TreeSitterUtil.range(doGroup))
           return
         }
 
         if (shouldRun === true) {
           // Always executes — analyze body (one iteration for now)
-          FlowAnalyzer.analyzeNode(bodyNode, bindings, ctx, state)
+          for (const child of doGroup.namedChildren) {
+            FlowAnalyzer.analyzeNode(child, bindings, ctx, state)
+          }
           return
         }
       }
     }
 
     // Unknown — analyze body
-    FlowAnalyzer.analyzeNode(bodyNode, bindings, ctx, state)
+    for (const child of doGroup.namedChildren) {
+      FlowAnalyzer.analyzeNode(child, bindings, ctx, state)
+    }
   }
 
   /**
@@ -1130,6 +1293,39 @@ export class FlowAnalyzer {
       if (node.namedChildren.length === 1) {
         return FlowAnalyzer.evaluateExpression(node.namedChildren[0], bindings, ctx)
       }
+      // Multiple children: treat as concatenation (e.g., "Hello, ${NAME}!")
+      if (node.namedChildren.length > 1) {
+        const parts: string[] = []
+        for (const child of node.namedChildren) {
+          if (child.type === 'string_content') {
+            parts.push(child.text)
+          } else {
+            const childEval = FlowAnalyzer.evaluateExpression(child, bindings, ctx)
+            if (childEval.success && childEval.value) {
+              const val = tryGetSingleValue(childEval.value)
+              if (val !== null) { parts.push(val); continue }
+            }
+            parts.push(child.text)
+          }
+        }
+        const result = parts.join('')
+        return {
+          success: true,
+          value: concrete(result),
+          isConstTruthy: result.length > 0 && result !== '0',
+          isConstFalsy: result.length === 0 || result === '0',
+        }
+      }
+    }
+
+    // Handle string_content directly (bare text inside a string)
+    if (node.type === 'string_content') {
+      return {
+        success: true,
+        value: concrete(node.text),
+        isConstTruthy: node.text.length > 0 && node.text !== '0',
+        isConstFalsy: node.text.length === 0 || node.text === '0',
+      }
     }
 
     return { success: false }
@@ -1209,39 +1405,91 @@ export class FlowAnalyzer {
 
         // For 'test' or '[' commands, try evaluating the expression
         if (cmdName === 'test' || cmdName === '[') {
-          if (args.length >= 2) {
-            // Simple binary test
-            const op = args[0]
-            const left = args[1]
-            const right = args[2]
-
-            if (right !== undefined) {
-              // Try to resolve left and right through bindings
-              const leftBind = bindings.get(left)
-              const rightBind = bindings.get(right)
-              const leftVal = leftBind ? tryGetSingleValue(leftBind) : left
-              const rightVal = rightBind ? tryGetSingleValue(rightBind) : right
-
-              if (leftVal !== null && rightVal !== null) {
-                switch (op) {
-                  case '=':
-                  case '==':
-                    return {
-                      success: true,
-                      isConstTruthy: leftVal === rightVal,
-                      isConstFalsy: leftVal !== rightVal,
-                    }
-                  case '!=':
-                    return {
-                      success: true,
-                      isConstTruthy: leftVal !== rightVal,
-                      isConstFalsy: leftVal === rightVal,
-                    }
-                }
-              }
-            }
-          }
+          return FlowAnalyzer.evaluateTestCommand(args, bindings)
         }
+      }
+    }
+
+    return { success: false }
+  }
+
+  /**
+   * Evaluate a 'test' / '[' command's arguments.
+   */
+  private static evaluateTestCommand(
+    args: string[],
+    bindings: FlowBindings,
+  ): EvalResult {
+    // Resolve an arg to its value if it's a variable reference
+    const resolve = (arg: string): string => {
+      const b = bindings.get(arg)
+      if (b) {
+        const v = tryGetSingleValue(b)
+        if (v !== null) return v
+      }
+      return arg
+    }
+
+    // Handle ! negation
+    if (args[0] === '!') {
+      const inner = FlowAnalyzer.evaluateTestCommand(args.slice(1), bindings)
+      if (inner.success) {
+        return {
+          success: true,
+          isConstTruthy: inner.isConstFalsy,
+          isConstFalsy: inner.isConstTruthy,
+        }
+      }
+      return { success: false }
+    }
+
+    // Unary operators: -z STR, -n STR, STR (truthiness)
+    if (args.length === 1) {
+      const val = resolve(args[0])
+      const truthy = val.length > 0 && val !== '0'
+      return { success: true, isConstTruthy: truthy, isConstFalsy: !truthy }
+    }
+
+    if (args.length === 2) {
+      const op = args[0]
+      const val = resolve(args[1])
+
+      switch (op) {
+        case '-z':
+          return { success: true, isConstTruthy: val.length === 0, isConstFalsy: val.length > 0 }
+        case '-n':
+          return { success: true, isConstTruthy: val.length > 0, isConstFalsy: val.length === 0 }
+      }
+    }
+
+    // Binary operators
+    if (args.length === 3) {
+      const op = args[0]
+      const left = resolve(args[1])
+      const right = resolve(args[2])
+
+      const leftNum = Number(left)
+      const rightNum = Number(right)
+      const hasNums = !isNaN(leftNum) && !isNaN(rightNum)
+
+      switch (op) {
+        case '=':
+        case '==':
+          return { success: true, isConstTruthy: left === right, isConstFalsy: left !== right }
+        case '!=':
+          return { success: true, isConstTruthy: left !== right, isConstFalsy: left === right }
+        case '-eq':
+          return { success: true, isConstTruthy: hasNums && leftNum === rightNum, isConstFalsy: !hasNums || leftNum !== rightNum }
+        case '-ne':
+          return { success: true, isConstTruthy: hasNums && leftNum !== rightNum, isConstFalsy: !hasNums || leftNum === rightNum }
+        case '-lt':
+          return { success: true, isConstTruthy: hasNums && leftNum < rightNum, isConstFalsy: !hasNums || leftNum >= rightNum }
+        case '-le':
+          return { success: true, isConstTruthy: hasNums && leftNum <= rightNum, isConstFalsy: !hasNums || leftNum > rightNum }
+        case '-gt':
+          return { success: true, isConstTruthy: hasNums && leftNum > rightNum, isConstFalsy: !hasNums || leftNum <= rightNum }
+        case '-ge':
+          return { success: true, isConstTruthy: hasNums && leftNum >= rightNum, isConstFalsy: !hasNums || leftNum < rightNum }
       }
     }
 
@@ -1262,9 +1510,13 @@ export class FlowAnalyzer {
       // Handle binary_expression: [[ $x -eq 1 ]]
       if (children.length === 1 && children[0].type === 'binary_expression') {
         const be = children[0]
-        if (be.namedChildren.length >= 3) {
-          return FlowAnalyzer.extractDiscriminantFromBinaryExpression(be.namedChildren)
-        }
+        return FlowAnalyzer.extractDiscriminantFromBinaryExpression(be)
+      }
+
+      // Handle unary_expression: [[ -z "$VAR" ]] -> $VAR is empty (length 0)
+      // [[ -n "$VAR" ]] -> $VAR is non-empty
+      if (children.length === 1 && children[0].type === 'unary_expression') {
+        return FlowAnalyzer.extractDiscriminantFromUnaryExpression(children[0])
       }
 
       if (children.length === 3) {
@@ -1352,26 +1604,55 @@ export class FlowAnalyzer {
    * Extract a discriminant from a binary_expression's named children [left, op, right]
    */
   private static extractDiscriminantFromBinaryExpression(
-    children: SyntaxNode[],
+    node: SyntaxNode,
   ): { variable: string; values: string[]; comparison: 'eq' | 'ne' } | null {
-    if (children.length < 3) return null
+    if (node.type !== 'binary_expression' || node.namedChildren.length < 2) return null
 
-    const op = children[1].text
+    // Find the operator: it may be a named test_operator or an anonymous token
+    let left: SyntaxNode
+    let right: SyntaxNode
+    let op: string
+
+    if (node.namedChildren.length >= 3 &&
+        (node.namedChildren[1].type === 'test_operator' ||
+         node.namedChildren[1].type === 'word')) {
+      left = node.namedChildren[0]
+      op = node.namedChildren[1].text
+      right = node.namedChildren[2]
+    } else {
+      left = node.namedChildren[0]
+      right = node.namedChildren[1]
+      op = ''
+      for (const child of node.children) {
+        if (!child.isNamed) {
+          op = child.text
+          break
+        }
+      }
+    }
+    if (!op) return null
     if (op !== '==' && op !== '=' && op !== '!=' && op !== '-eq' && op !== '-ne') return null
 
     let varName: string | null = null
     let value: string | null = null
 
     // Try left as variable
-    if (children[0].type === 'simple_expansion' || children[0].type === 'expansion') {
-      const vn = children[0].descendantsOfType('variable_name')[0]
+    if (left.type === 'simple_expansion' || left.type === 'expansion') {
+      const vn = left.descendantsOfType('variable_name')[0]
       if (vn) varName = vn.text
-    } else if (children[0].type === 'variable_name') {
-      varName = children[0].text
+    } else if (left.type === 'variable_name') {
+      varName = left.text
     }
-    value = TreeSitterUtil.resolveStaticString(children[2])
-    // Also try number nodes
-    if (value === null && children[2].type === 'number') value = children[2].text
+    // Left could also be a string containing an expansion like "$VAR"
+    if (!varName && left.type === 'string' && left.namedChildren.length > 0) {
+      const inner = left.namedChildren[0]
+      if (inner.type === 'simple_expansion' || inner.type === 'expansion') {
+        const vn = inner.descendantsOfType('variable_name')[0]
+        if (vn) varName = vn.text
+      }
+    }
+    value = TreeSitterUtil.resolveStaticString(right)
+    if (value === null && right.type === 'number') value = right.text
 
     if (varName && value !== null) {
       const comp = (op === '!=' || op === '-ne') ? 'ne' as const : 'eq' as const
@@ -1381,18 +1662,65 @@ export class FlowAnalyzer {
     // Try right as variable
     varName = null
     value = null
-    if (children[2].type === 'simple_expansion' || children[2].type === 'expansion') {
-      const vn = children[2].descendantsOfType('variable_name')[0]
+    if (right.type === 'simple_expansion' || right.type === 'expansion') {
+      const vn = right.descendantsOfType('variable_name')[0]
       if (vn) varName = vn.text
-    } else if (children[2].type === 'variable_name') {
-      varName = children[2].text
+    } else if (right.type === 'variable_name') {
+      varName = right.text
     }
-    value = TreeSitterUtil.resolveStaticString(children[0])
-    if (value === null && children[0].type === 'number') value = children[0].text
+    if (!varName && right.type === 'string' && right.namedChildren.length > 0) {
+      const inner = right.namedChildren[0]
+      if (inner.type === 'simple_expansion' || inner.type === 'expansion') {
+        const vn = inner.descendantsOfType('variable_name')[0]
+        if (vn) varName = vn.text
+      }
+    }
+    value = TreeSitterUtil.resolveStaticString(left)
+    if (value === null && left.type === 'number') value = left.text
 
     if (varName && value !== null) {
       const comp = (op === '!=' || op === '-ne') ? 'ne' as const : 'eq' as const
       return { variable: varName, values: [value], comparison: comp }
+    }
+
+    return null
+  }
+
+  /**
+   * Extract a discriminant from a unary_expression like -z "$VAR" or -n "$VAR".
+   */
+  private static extractDiscriminantFromUnaryExpression(
+    node: SyntaxNode,
+  ): { variable: string; values: string[]; comparison: 'eq' | 'ne' } | null {
+    if (node.type !== 'unary_expression' || node.namedChildren.length < 2) return null
+
+    const op = node.namedChildren[0].text
+    const operand = node.namedChildren[1]
+
+    // Find variable name in the operand
+    let varName: string | null = null
+    if (operand.type === 'simple_expansion' || operand.type === 'expansion') {
+      const vn = operand.descendantsOfType('variable_name')[0]
+      if (vn) varName = vn.text
+    } else if (operand.type === 'string' && operand.namedChildren.length > 0) {
+      const inner = operand.namedChildren[0]
+      if (inner.type === 'simple_expansion' || inner.type === 'expansion') {
+        const vn = inner.descendantsOfType('variable_name')[0]
+        if (vn) varName = vn.text
+      }
+    } else if (operand.type === 'variable_name') {
+      varName = operand.text
+    }
+
+    if (!varName) return null
+
+    // -z VAR: VAR is empty (equals "")
+    // -n VAR: VAR is non-empty (does not equal "")
+    if (op === '-z') {
+      return { variable: varName, values: [''], comparison: 'eq' }
+    }
+    if (op === '-n') {
+      return { variable: varName, values: [''], comparison: 'ne' }
     }
 
     return null
@@ -1435,13 +1763,39 @@ export class FlowAnalyzer {
     bindings: FlowBindings,
     ctx: FlowAnalysisContext,
   ): EvalResult {
-    if (node.type !== 'binary_expression' || node.namedChildren.length < 3) {
+    if (node.type !== 'binary_expression' || node.namedChildren.length < 2) {
       return { success: false }
     }
 
-    const left = FlowAnalyzer.evaluateExpression(node.namedChildren[0], bindings, ctx)
-    const op = node.namedChildren[1].text
-    const right = FlowAnalyzer.evaluateExpression(node.namedChildren[2], bindings, ctx)
+    // The operator may be a named child (test_operator like -eq, -lt) or
+    // an anonymous child (==, !=, =). Find it.
+    let leftNode: SyntaxNode
+    let rightNode: SyntaxNode
+    let op: string
+
+    // Check if the second named child is a test_operator
+    if (node.namedChildren.length >= 3 &&
+        (node.namedChildren[1].type === 'test_operator' ||
+         node.namedChildren[1].type === 'word')) {
+      leftNode = node.namedChildren[0]
+      op = node.namedChildren[1].text
+      rightNode = node.namedChildren[2]
+    } else {
+      // Operator is an anonymous child between the two named operands
+      leftNode = node.namedChildren[0]
+      rightNode = node.namedChildren[1]
+      op = ''
+      for (const child of node.children) {
+        if (!child.isNamed) {
+          op = child.text
+          break
+        }
+      }
+    }
+    if (!op) return { success: false }
+
+    const left = FlowAnalyzer.evaluateExpression(leftNode, bindings, ctx)
+    const right = FlowAnalyzer.evaluateExpression(rightNode, bindings, ctx)
 
     if (!left.success || !right.success || !left.value || !right.value) {
       return { success: false }
@@ -1714,10 +2068,22 @@ export class FlowAnalyzer {
         continue
       }
 
-      // Direct expansion at top level: ( $VAR )
+      // Direct expansion at top level: ( $VAR ) or ( ${ARR[@]} )
       if (child.type === 'simple_expansion' || child.type === 'expansion') {
         const varNode = child.descendantsOfType('variable_name')[0]
         if (varNode) {
+          // Check for array subscript ${ARR[@]} or ${ARR[*]}
+          const subNode = child.descendantsOfType('subscript')[0]
+          if (subNode) {
+            const idxNode = subNode.namedChildren.find(c => c.type !== 'variable_name')
+            if (idxNode && (idxNode.text === '@' || idxNode.text === '*')) {
+              const b = bindings.get(varNode.text)
+              if (b) {
+                const elems = tryGetArrayElements(b)
+                if (elems) { elements.push(...elems); continue }
+              }
+            }
+          }
           const b = bindings.get(varNode.text)
           if (b) {
             const v = tryGetSingleValue(b)
@@ -1728,12 +2094,24 @@ export class FlowAnalyzer {
         continue
       }
 
-      // String with a single nested expansion: "$VAR"
+      // String with a single nested expansion: "$VAR" or "${ARR[@]}"
       if (child.type === 'string' && child.namedChildren.length === 1) {
         const inner = child.namedChildren[0]
         if (inner.type === 'simple_expansion' || inner.type === 'expansion') {
           const varNode = inner.descendantsOfType('variable_name')[0]
           if (varNode) {
+            // Check for array subscript ${ARR[@]} or ${ARR[*]}
+            const subNode = inner.descendantsOfType('subscript')[0]
+            if (subNode) {
+              const idxNode = subNode.namedChildren.find(c => c.type !== 'variable_name')
+              if (idxNode && (idxNode.text === '@' || idxNode.text === '*')) {
+                const b = bindings.get(varNode.text)
+                if (b) {
+                  const elems = tryGetArrayElements(b)
+                  if (elems) { elements.push(...elems); continue }
+                }
+              }
+            }
             const b = bindings.get(varNode.text)
             if (b) {
               const v = tryGetSingleValue(b)
@@ -1836,27 +2214,109 @@ export class FlowAnalyzer {
       }
     }
 
-    // Try to evaluate the arithmetic expression
-    try {
-      // Safe eval: only allow numbers, operators, and parens
-      const safeExpr = evalExpr.replace(/[^0-9+\-*/().%\s]/g, '')
-      if (safeExpr === evalExpr || safeExpr.length > 0) {
-        const result = Function(`"use strict"; return (${safeExpr})`)()
-        if (typeof result === 'number' && !isNaN(result)) {
-          return {
-            success: true,
-            value: concrete(String(result), 'assignment', undefined),
-            numericValue: result,
-            isConstTruthy: result !== 0,
-            isConstFalsy: result === 0,
-          }
-        }
+    // Safe recursive-descent arithmetic evaluator (bash uses integer arithmetic)
+    const result = FlowAnalyzer.safeEvalArithmetic(evalExpr)
+    if (result !== null) {
+      return {
+        success: true,
+        value: concrete(String(result), 'assignment', undefined),
+        numericValue: result,
+        isConstTruthy: result !== 0,
+        isConstFalsy: result === 0,
       }
-    } catch {
-      // Can't evaluate
     }
 
     return { success: false }
+  }
+
+  /**
+   * Safe integer arithmetic expression evaluator (recursive descent).
+   * Supports: +, -, *, / (integer division), %, (, ), unary -, and whitespace.
+   * Returns null if the expression cannot be evaluated.
+   */
+  private static safeEvalArithmetic(expr: string): number | null {
+    const s = expr.replace(/\s+/g, '')
+    if (s.length === 0) return null
+
+    let pos = 0
+
+    const peek = (): string => (pos < s.length ? s[pos] : '')
+    const consume = (): string => s[pos++]
+
+    const parseNumber = (): number | null => {
+      let numStr = ''
+      if (peek() === '-') {
+        // Could be unary minus or subtraction — handled by caller
+        return null
+      }
+      while (pos < s.length && /[0-9]/.test(peek())) {
+        numStr += consume()
+      }
+      if (numStr.length === 0) return null
+      return parseInt(numStr, 10)
+    }
+
+    const parseAtom = (): number | null => {
+      if (peek() === '(') {
+        consume() // '('
+        const val = parseExpr()
+        if (val === null) return null
+        if (peek() === ')') {
+          consume() // ')'
+          return val
+        }
+        return null
+      }
+      if (peek() === '-') {
+        consume() // '-'
+        const val = parseAtom()
+        if (val === null) return null
+        return -val
+      }
+      return parseNumber()
+    }
+
+    const parseMulDiv = (): number | null => {
+      let left = parseAtom()
+      if (left === null) return null
+
+      while (peek() === '*' || peek() === '/' || peek() === '%') {
+        const op = consume()
+        const right = parseAtom()
+        if (right === null) return null
+        if (op === '*') {
+          left = left * right
+        } else if (op === '/') {
+          if (right === 0) return null
+          left = Math.trunc(left / right) // bash integer division
+        } else if (op === '%') {
+          if (right === 0) return null
+          left = left % right
+        }
+      }
+      return left
+    }
+
+    const parseExpr = (): number | null => {
+      let left = parseMulDiv()
+      if (left === null) return null
+
+      while (peek() === '+' || peek() === '-') {
+        const op = consume()
+        const right = parseMulDiv()
+        if (right === null) return null
+        if (op === '+') {
+          left = left + right
+        } else {
+          left = left - right
+        }
+      }
+      return left
+    }
+
+    const result = parseExpr()
+    if (result === null || pos < s.length) return null
+    return result
   }
 
   /**

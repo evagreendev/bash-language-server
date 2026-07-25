@@ -110,7 +110,12 @@ export function resolveStaticString(node: SyntaxNode): string | null {
     const children = node.namedChildren
     if (children.length === 1 && children[0].type === 'string_content')
       return children[0].text
+    // Multiple children with only string_content are still static
+    if (children.every(c => c.type === 'string_content')) {
+      return children.map(c => c.text).join('')
+    }
     return null
   }
+  if (node.type === 'string_content') return node.text
   return null
 }

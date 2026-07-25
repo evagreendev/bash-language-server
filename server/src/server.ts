@@ -21,8 +21,10 @@ import {
   getCompgenCompletions,
   getFileCompletions,
   isFilePathContext,
+  resolveConcatenationPath,
 } from './util/compgen'
 import { formatFlowValue, tryGetArrayElements } from './util/flow-value'
+import { getEmbeddedSemanticTokens, SEMANTIC_TOKEN_LEGEND } from './util/embedded-tokens'
 import { uniqueBasedOnHash } from './util/array'
 import { logger, setLogConnection, setLogLevel } from './util/logger'
 import { isPositionIncludedInRange } from './util/lsp'
@@ -146,6 +148,10 @@ export default class BashServer {
       inlayHintProvider: {
         resolveProvider: false,
       },
+      semanticTokensProvider: {
+        legend: SEMANTIC_TOKEN_LEGEND,
+        full: true,
+      },
     }
   }
 
@@ -193,6 +199,7 @@ export default class BashServer {
     // Inlay hints are registered conditionally (not all LSP clients support them)
     if (connection.languages?.inlayHint) {
       connection.languages.inlayHint.on(this.onInlayHint.bind(this))
+      connection.languages.semanticTokens.on(this.onSemanticTokens.bind(this))
     }
 
     /**
@@ -475,6 +482,17 @@ export default class BashServer {
 
     this.logRequest({ request: 'onCompletion', params, word })
 
+    // DEBUG: log completion context
+    const wordCol = Math.max(params.position.character - 1, 0)
+    const cmdAtPoint = this.analyzer.commandNameAtPoint(params.textDocument.uri, params.position.line, wordCol)
+    const concatText = this.analyzer.getConcatenationTextAtPoint(params.textDocument.uri, params.position.line, wordCol)
+    const isPathCtx = (word && isFilePathContext(word)) || (word === null && cmdAtPoint !== null)
+    logger.info(
+      `[completion] L${params.position.line}C${params.position.character} ` +
+      `word=${JSON.stringify(word)} isPathCtx=${isPathCtx} cmd=${JSON.stringify(cmdAtPoint)} ` +
+      `concat=${JSON.stringify(concatText)}`
+    )
+
     if (word?.startsWith('#')) {
       // Inside a comment block — check for shellcheck source=/source-fallback= directive completion
       return this.getShellcheckDirectiveCompletions(params, word)
@@ -611,10 +629,30 @@ export default class BashServer {
         ? path.dirname(currentUri.replace('file://', ''))
         : this.workspaceFolder || process.cwd()
 
-      const files = getFileCompletions(word || '', currentFileDir)
+      // Check if this word is part of a concatenation like "$HOME"/.local/
+      // If so, resolve the variable expansion and use the full path for completions
+      const concatText = this.analyzer.getConcatenationTextAtPoint(
+        currentUri,
+        params.position.line,
+        Math.max(params.position.character - 1, 0),
+      )
+      let resolvedPrefix = ''
+      if (concatText && concatText !== word) {
+        const resolved = resolveConcatenationPath(concatText)
+        if (resolved) {
+          resolvedPrefix = resolved
+        }
+      }
+
+      const completionWord = resolvedPrefix || word || ''
+      const files = getFileCompletions(completionWord, currentFileDir)
+
+      // Calculate the edit range from the actual word position in the AST
+      const wordCol = Math.max(params.position.character - 1, 0)
+      const wordStartCol = this.analyzer.wordStartColumnAtPoint(currentUri, params.position.line, wordCol)
       const editRange: LSP.Range = {
         start: {
-          character: params.position.character - (word?.length || 0),
+          character: wordStartCol >= 0 ? wordStartCol : params.position.character - (word?.length || 0),
           line: params.position.line,
         },
         end: {
@@ -632,6 +670,9 @@ export default class BashServer {
           newText: file,
           range: editRange,
         },
+        // VS Code filters by fuzzy-matching filterText against the word
+        // being replaced. Use the word itself so all file completions pass.
+        filterText: word || file,
       }))
     }
 
@@ -658,21 +699,24 @@ export default class BashServer {
     }
 
     const allCompletions = [
-      ...reservedWordsCompletions,
-      ...symbolCompletions,
-      ...programCompletions,
-      ...builtinsCompletions,
+      // Don't suggest anything but file completions when in a path context
+      ...(isPathContext ? [] : reservedWordsCompletions),
+      ...(isPathContext ? [] : symbolCompletions),
+      ...(isPathContext ? [] : programCompletions),
+      ...(isPathContext ? [] : builtinsCompletions),
       ...optionsCompletions,
       ...filePathCompletions,
-      ...compgenCompletions,
-      ...SNIPPETS,
+      ...(isPathContext ? [] : compgenCompletions),
+      ...(isPathContext ? [] : SNIPPETS),
     ]
 
-    if (word) {
-      // Filter to only return suffixes of the current word
-      return allCompletions.filter((item) => item.label.startsWith(word))
+    if (word && !isPathContext) {
+      const filtered = allCompletions.filter((item) => item.label.startsWith(word))
+      logger.info(`[completion] returning ${filtered.length} filtered items (word filter)`)
+      return filtered
     }
 
+    logger.info(`[completion] returning ${allCompletions.length} items (total), fileComps=${filePathCompletions.length}`)
     return allCompletions
   }
 
@@ -1008,6 +1052,17 @@ export default class BashServer {
       kind: LSP.InlayHintKind.Type,
       paddingLeft: hint.paddingLeft,
     }))
+  }
+
+  private onSemanticTokens(params: LSP.SemanticTokensParams): LSP.SemanticTokens {
+    logger.debug(`onSemanticTokens for ${params.textDocument.uri}`)
+
+    const rootNode = this.analyzer.getRootNode(params.textDocument.uri)
+    if (!rootNode) {
+      return { data: [] }
+    }
+
+    return getEmbeddedSemanticTokens(rootNode)
   }
 
   /**
