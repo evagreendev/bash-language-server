@@ -351,15 +351,13 @@ export default class BashServer {
     if (this.config.enableFlowAnalysis) {
       const dimmedRanges = this.analyzer.getDimmedRanges(uri)
       for (const range of dimmedRanges) {
-        diagnostics.push(
-          LSP.Diagnostic.create(
-            range,
-            'Code in this branch is never executed (constant condition)',
-            LSP.DiagnosticSeverity.Hint,
-            undefined,
-            'bash-language-server (flow analysis)',
-          ),
-        )
+        diagnostics.push({
+          range,
+          message: 'Code in this branch is never executed (constant condition)',
+          severity: LSP.DiagnosticSeverity.Hint,
+          source: 'bash-language-server (flow analysis)',
+          tags: [LSP.DiagnosticTag.Unnecessary],
+        })
       }
 
       // Add error diagnostics for source commands that reference missing files

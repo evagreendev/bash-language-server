@@ -36,6 +36,8 @@ function makeContext(
     trackInlayHints: true,
     inlayHints: [],
     dimmedRanges: [],
+    sourceErrors: [],
+    topLevelUri: uri,
     ...overrides,
   }
 }
@@ -229,6 +231,85 @@ describe('FlowAnalyzer', () => {
     it('dims untaken branches', () => {
       const { ctx } = analyzeFixture('if-constexpr.sh')
       expect(ctx.dimmedRanges.length).toBeGreaterThan(0)
+    })
+
+    it('resolves command name from quoted variable expansion ("$VAR"=false)', () => {
+      const { bindings } = analyzeFixture('if-constexpr.sh')
+      expect(getVar(bindings, 'CMD_VAR_THEN')).toBeNull()
+      expect(getVar(bindings, 'CMD_VAR_ELSE')).toBe('command-is-false')
+    })
+
+    it('resolves command name from quoted variable expansion ("$VAR"=true)', () => {
+      const { bindings } = analyzeFixture('if-constexpr.sh')
+      expect(getVar(bindings, 'CMD_TRUE_THEN')).toBe('command-is-true')
+      expect(getVar(bindings, 'CMD_TRUE_ELSE')).toBeNull()
+    })
+
+    it('resolves command name from bare variable expansion ($VAR=false)', () => {
+      const { bindings } = analyzeFixture('if-constexpr.sh')
+      expect(getVar(bindings, 'CMD_VAR2_THEN')).toBeNull()
+      expect(getVar(bindings, 'CMD_VAR2_ELSE')).toBe('command-is-false-bare')
+    })
+
+    // ── composite conditions (&& / ||) ──
+
+    it('evaluates true && true as truthy', () => {
+      const { bindings } = analyzeFixture('if-constexpr.sh')
+      expect(getVar(bindings, 'COMPOSITE_AND_TRUE')).toBe('taken')
+    })
+
+    it('evaluates true && false as falsy', () => {
+      const { bindings } = analyzeFixture('if-constexpr.sh')
+      expect(getVar(bindings, 'COMPOSITE_AND_FALSE')).toBe('else-taken')
+    })
+
+    it('evaluates false || true as truthy (short-circuit)', () => {
+      const { bindings } = analyzeFixture('if-constexpr.sh')
+      expect(getVar(bindings, 'COMPOSITE_OR_TRUE')).toBe('taken-short-circuit')
+    })
+
+    it('evaluates false || false as falsy', () => {
+      const { bindings } = analyzeFixture('if-constexpr.sh')
+      expect(getVar(bindings, 'COMPOSITE_OR_FALSE')).toBe('else-taken')
+    })
+
+    it('evaluates test_command && true mixed composite', () => {
+      const { bindings } = analyzeFixture('if-constexpr.sh')
+      expect(getVar(bindings, 'COMPOSITE_MIXED')).toBe('taken')
+    })
+
+    it('evaluates test_command || arithmetic mixed composite', () => {
+      const { bindings } = analyzeFixture('if-constexpr.sh')
+      expect(getVar(bindings, 'COMPOSITE_MIXED2')).toBe('taken-short-circuit')
+    })
+
+    // ── arithmetic expansion as command ──
+
+    it('evaluates (( 5 == 5 )) as truthy', () => {
+      const { bindings } = analyzeFixture('if-constexpr.sh')
+      expect(getVar(bindings, 'ARITH_TRUE')).toBe('taken')
+    })
+
+    it('evaluates (( 5 == 3 )) as falsy', () => {
+      const { bindings } = analyzeFixture('if-constexpr.sh')
+      expect(getVar(bindings, 'ARITH_FALSE')).toBe('else-taken')
+    })
+
+    it('evaluates (( X > 5 )) with known variable X=10 as truthy', () => {
+      const { bindings } = analyzeFixture('if-constexpr.sh')
+      expect(getVar(bindings, 'ARITH_VAR_TRUE')).toBe('taken')
+    })
+
+    it('evaluates (( X == 0 )) with known variable X=10 as falsy', () => {
+      const { bindings } = analyzeFixture('if-constexpr.sh')
+      expect(getVar(bindings, 'ARITH_VAR_FALSE')).toBe('else-taken')
+    })
+
+    // ── composite with variable command ──
+
+    it('evaluates true && "$VAR" where VAR=true as truthy', () => {
+      const { bindings } = analyzeFixture('if-constexpr.sh')
+      expect(getVar(bindings, 'COMPOSITE_VAR_CMD')).toBe('taken')
     })
   })
 

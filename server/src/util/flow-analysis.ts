@@ -889,9 +889,9 @@ export class FlowAnalyzer {
     ctx: FlowAnalysisContext,
     state: { pwd: string },
   ): void {
-    // Find condition: first named child that is test_command, command, or bracket_expression
+    // Find condition: first named child that is a test_command, command, list, or bracket_expression
     const conditionNode = node.namedChildren.find(c =>
-      ['test_command', 'bracket_expression', 'command', 'word'].includes(c.type)
+      ['test_command', 'bracket_expression', 'command', 'word', 'list'].includes(c.type)
     )
 
     const evalResult = conditionNode
@@ -1245,7 +1245,7 @@ export class FlowAnalyzer {
     state: { pwd: string },
   ): void {
     const conditionNode = node.namedChildren.find(c =>
-      ['test_command', 'bracket_expression', 'command', 'word'].includes(c.type)
+      ['test_command', 'bracket_expression', 'command', 'word', 'list'].includes(c.type)
     )
 
     const doGroup = node.namedChildren.find(c => c.type === 'do_group')
@@ -1470,6 +1470,64 @@ export class FlowAnalyzer {
   }
 
   /**
+   * Evaluate a list of commands/conditions joined by && and || with
+   * short-circuit evaluation (left-associative, equal precedence).
+   */
+  private static evaluateList(
+    node: SyntaxNode,
+    bindings: FlowBindings,
+    ctx: FlowAnalysisContext,
+  ): EvalResult {
+    // Children alternate: operand, operator (&& or ||), operand, ...
+    let currentResult: EvalResult | null = null
+    let currentOperator: string | null = null
+
+    for (const child of node.children) {
+      if (child.isNamed) {
+        const operandResult = FlowAnalyzer.evaluateCondition(child, bindings, ctx)
+
+        if (currentResult === null) {
+          currentResult = operandResult
+        } else if (currentOperator === '&&') {
+          // left && right
+          if (currentResult.success && currentResult.isConstFalsy) {
+            // false && anything = false (short-circuit, keep currentResult)
+          } else if (currentResult.success && currentResult.isConstTruthy) {
+            // true && right = right
+            currentResult = operandResult
+          } else if (operandResult.success && operandResult.isConstFalsy) {
+            // unknown && false = false
+            currentResult = operandResult
+          } else {
+            currentResult = { success: false }
+          }
+        } else if (currentOperator === '||') {
+          // left || right
+          if (currentResult.success && currentResult.isConstTruthy) {
+            // true || anything = true (short-circuit, keep currentResult)
+          } else if (currentResult.success && currentResult.isConstFalsy) {
+            // false || right = right
+            currentResult = operandResult
+          } else if (operandResult.success && operandResult.isConstTruthy) {
+            // unknown || true = true
+            currentResult = operandResult
+          } else {
+            currentResult = { success: false }
+          }
+        }
+        currentOperator = null
+      } else {
+        // Anonymous child — should be && or ||
+        if (child.type === '&&' || child.type === '||') {
+          currentOperator = child.type
+        }
+      }
+    }
+
+    return currentResult || { success: false }
+  }
+
+  /**
    * Evaluate a condition expression for constant truthiness.
    */
   private static evaluateCondition(
@@ -1523,12 +1581,17 @@ export class FlowAnalyzer {
       }
     }
 
+    // Handle list conditions (cmd1 && cmd2, cmd1 || cmd2)
+    if (node.type === 'list') {
+      return FlowAnalyzer.evaluateList(node, bindings, ctx)
+    }
+
     // Handle command conditions
     if (node.type === 'command') {
       const cmdNameNode = node.descendantsOfType('command_name')[0]
       if (cmdNameNode) {
-        // [[, [, test commands with known outcomes
-        const cmdName = cmdNameNode.text
+        // Resolve the command name, handling variable expansions like `"$VAR"` or `$VAR`
+        const cmdName = FlowAnalyzer.resolveCommandName(cmdNameNode, bindings, ctx)
         // Try to get args
         const args = node.namedChildren
           .filter(c => c.type === 'word' || c.type === 'string')
@@ -2369,7 +2432,8 @@ export class FlowAnalyzer {
 
   /**
    * Safe integer arithmetic expression evaluator (recursive descent).
-   * Supports: +, -, *, / (integer division), %, (, ), unary -, and whitespace.
+   * Supports: +, -, *, /, %, ==, !=, <, >, <=, >=, &&, ||, !, (, ), unary -, and whitespace.
+   * Bash semantics: comparison and logical operators return 1 for true, 0 for false.
    * Returns null if the expression cannot be evaluated.
    */
   private static safeEvalArithmetic(expr: string): number | null {
@@ -2380,13 +2444,14 @@ export class FlowAnalyzer {
 
     const peek = (): string => (pos < s.length ? s[pos] : '')
     const consume = (): string => s[pos++]
+    /** Peek ahead n characters (n must be exactly the lookahead needed). */
+    const lookahead = (n: number): string =>
+      pos + n <= s.length ? s.slice(pos, pos + n) : ''
 
     const parseNumber = (): number | null => {
       let numStr = ''
-      if (peek() === '-') {
-        // Could be unary minus or subtraction — handled by caller
-        return null
-      }
+      // Handle negative numbers only when preceded by an operator or at start
+      // (unary minus is handled at the unary level)
       while (pos < s.length && /[0-9]/.test(peek())) {
         numStr += consume()
       }
@@ -2394,10 +2459,38 @@ export class FlowAnalyzer {
       return parseInt(numStr, 10)
     }
 
-    const parseAtom = (): number | null => {
+    // Precedence levels (lowest to highest):
+    //   parseOr       → ||
+    //   parseAnd      → &&
+    //   parseCmp      → ==  !=  <  >  <=  >=
+    //   parseAddSub   → +  -
+    //   parseMulDiv   → *  /  %
+    //   parseUnary    → -  !  (expr)  number
+
+    const parseUnary = (): number | null => {
+      // Logical NOT
+      if (peek() === '!') {
+        consume()
+        const val = parseUnary()
+        if (val === null) return null
+        return val === 0 ? 1 : 0
+      }
+      // Unary minus
+      if (peek() === '-') {
+        consume()
+        const val = parseUnary()
+        if (val === null) return null
+        return -val
+      }
+      // Unary plus
+      if (peek() === '+') {
+        consume()
+        return parseUnary()
+      }
+      // Parenthesized expression
       if (peek() === '(') {
         consume() // '('
-        const val = parseExpr()
+        const val = parseOr()
         if (val === null) return null
         if (peek() === ')') {
           consume() // ')'
@@ -2405,22 +2498,16 @@ export class FlowAnalyzer {
         }
         return null
       }
-      if (peek() === '-') {
-        consume() // '-'
-        const val = parseAtom()
-        if (val === null) return null
-        return -val
-      }
       return parseNumber()
     }
 
     const parseMulDiv = (): number | null => {
-      let left = parseAtom()
+      let left = parseUnary()
       if (left === null) return null
 
       while (peek() === '*' || peek() === '/' || peek() === '%') {
         const op = consume()
-        const right = parseAtom()
+        const right = parseUnary()
         if (right === null) return null
         if (op === '*') {
           left = left * right
@@ -2435,7 +2522,7 @@ export class FlowAnalyzer {
       return left
     }
 
-    const parseExpr = (): number | null => {
+    const parseAddSub = (): number | null => {
       let left = parseMulDiv()
       if (left === null) return null
 
@@ -2452,7 +2539,74 @@ export class FlowAnalyzer {
       return left
     }
 
-    const result = parseExpr()
+    const parseCmp = (): number | null => {
+      let left = parseAddSub()
+      if (left === null) return null
+
+      // Two-char operators checked first (>=, <=, ==, !=)
+      const twoCharOps: Record<string, (a: number, b: number) => number> = {
+        '==': (a, b) => (a === b ? 1 : 0),
+        '!=': (a, b) => (a !== b ? 1 : 0),
+        '<=': (a, b) => (a <= b ? 1 : 0),
+        '>=': (a, b) => (a >= b ? 1 : 0),
+      }
+      const oneCharOps: Record<string, (a: number, b: number) => number> = {
+        '<': (a, b) => (a < b ? 1 : 0),
+        '>': (a, b) => (a > b ? 1 : 0),
+      }
+
+      while (true) {
+        // Try two-char operators first
+        let fn = twoCharOps[lookahead(2)]
+        if (fn) {
+          pos += 2
+          const right = parseAddSub()
+          if (right === null) return null
+          left = fn(left, right)
+          continue
+        }
+        fn = oneCharOps[peek()]
+        if (fn) {
+          consume()
+          const right = parseAddSub()
+          if (right === null) return null
+          left = fn(left, right)
+          continue
+        }
+        break
+      }
+      return left
+    }
+
+    const parseAnd = (): number | null => {
+      let left = parseCmp()
+      if (left === null) return null
+
+      while (lookahead(2) === '&&') {
+        pos += 2
+        const right = parseCmp()
+        if (right === null) return null
+        // Bash &&: returns 1 if both non-zero, else 0
+        left = (left !== 0 && right !== 0) ? 1 : 0
+      }
+      return left
+    }
+
+    const parseOr = (): number | null => {
+      let left = parseAnd()
+      if (left === null) return null
+
+      while (lookahead(2) === '||') {
+        pos += 2
+        const right = parseAnd()
+        if (right === null) return null
+        // Bash ||: returns 1 if either non-zero, else 0
+        left = (left !== 0 || right !== 0) ? 1 : 0
+      }
+      return left
+    }
+
+    const result = parseOr()
     if (result === null || pos < s.length) return null
     return result
   }
@@ -2503,6 +2657,95 @@ export class FlowAnalyzer {
   /**
    * Try to resolve a node to a single string value.
    */
+  /**
+   * Resolve a command_name node to its runtime command string.
+   * Handles literal words, strings with variable expansions,
+   * simple_expansion ($VAR), expansion (${VAR}), and concatenations.
+   */
+  private static resolveCommandName(
+    cmdNameNode: SyntaxNode,
+    bindings: FlowBindings,
+    ctx: FlowAnalysisContext,
+  ): string | null {
+    // command_name is a wrapper node; delegate to its inner child
+    if (cmdNameNode.type === 'command_name') {
+      const inner = cmdNameNode.namedChildren[0]
+      if (inner) {
+        return FlowAnalyzer.resolveCommandName(inner, bindings, ctx)
+      }
+      return null
+    }
+
+    if (cmdNameNode.type === 'word') {
+      return cmdNameNode.text
+    }
+
+    if (cmdNameNode.type === 'string') {
+      // Plain quoted string: "false", 'false'
+      if (cmdNameNode.namedChildren.length === 0) {
+        return cmdNameNode.text.slice(1, -1)
+      }
+      // String with a single expansion: "$VAR"
+      if (cmdNameNode.namedChildren.length === 1) {
+        return FlowAnalyzer.resolveCommandName(cmdNameNode.namedChildren[0], bindings, ctx)
+      }
+      // String with multiple children: "$PREFIX$CMD" — join resolved parts
+      const parts: string[] = []
+      for (const child of cmdNameNode.namedChildren) {
+        if (child.type === 'string_content') {
+          parts.push(child.text)
+        } else {
+          const resolved = FlowAnalyzer.resolveCommandName(child, bindings, ctx)
+          if (resolved === null) return null
+          parts.push(resolved)
+        }
+      }
+      return parts.join('')
+    }
+
+    if (cmdNameNode.type === 'simple_expansion') {
+      // $VAR
+      const varNameNode = cmdNameNode.descendantsOfType('variable_name')[0]
+      if (varNameNode) {
+        const binding = bindings.get(varNameNode.text)
+        if (binding) return tryGetSingleValue(binding)
+      }
+      return null
+    }
+
+    if (cmdNameNode.type === 'expansion') {
+      // ${VAR} or ${VAR:-default} etc.
+      const varNameNode = cmdNameNode.descendantsOfType('variable_name')[0]
+      if (varNameNode) {
+        const binding = bindings.get(varNameNode.text)
+        if (binding) return tryGetSingleValue(binding)
+      }
+      return null
+    }
+
+    if (cmdNameNode.type === 'arithmetic_expansion') {
+      // (( expr )) as a command — evaluate and return 'true' (non-zero) or 'false' (zero)
+      const result = FlowAnalyzer.evaluateArithmetic(cmdNameNode, bindings, ctx)
+      if (result.success) {
+        if (result.isConstTruthy) return 'true'
+        if (result.isConstFalsy) return 'false'
+      }
+      return null
+    }
+
+    if (cmdNameNode.type === 'concatenation') {
+      const parts: string[] = []
+      for (const child of cmdNameNode.namedChildren) {
+        const resolved = FlowAnalyzer.resolveCommandName(child, bindings, ctx)
+        if (resolved === null) return null
+        parts.push(resolved)
+      }
+      return parts.join('')
+    }
+
+    return null
+  }
+
   private static tryResolveValue(
     node: SyntaxNode,
     bindings: FlowBindings,
