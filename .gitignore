@@ -17,3 +17,6 @@ package-lock.json
 
 # YARN cache
 .yarn/
+
+.pnpm-store
+*.tsbuildinfo
