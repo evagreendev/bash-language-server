@@ -809,8 +809,24 @@ export class FlowAnalyzer {
     const directives = parseBashIdeDirectives(text)
     for (const d of directives.directives) {
       if (d.type === 'source' && d.value) {
+        // Expand $VAR / ${VAR} references using current flow bindings
+        let expandedPath = d.value
+        // Strip surrounding quotes if present (single or double)
+        expandedPath = expandedPath.replace(/^["'](.+)["']$/, '$1')
+        expandedPath = expandedPath.replace(
+          /\$\{?(\w+)\}?/g,
+          (_match, varName: string) => {
+            const binding = bindings.get(varName)
+            if (binding) {
+              const val = tryGetSingleValue(binding)
+              if (val !== null) return val
+            }
+            return _match // keep as-is if unresolved
+          },
+        )
+
         const resolved = FlowAnalyzer.resolveAbsolutePath(
-          d.value,
+          expandedPath,
           ctx.sourcePushd ? path.dirname(fileURLToPath(ctx.uri)) : state.pwd,
         )
         if (resolved) {

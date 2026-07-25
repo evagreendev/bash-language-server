@@ -1152,28 +1152,52 @@ export default class BashServer {
   }
 
   /**
-   * List files in the directory of `uri` matching the given prefix.
+   * List files relative to the directory of `uri` matching the given prefix.
+   * Handles ./ ../ and absolute prefixes correctly.
    */
   private getDirectiveFilePathCompletions(
     uri: string,
     searchPrefix: string,
   ): BashCompletionItem[] {
     try {
-      const searchDir = path.dirname(uri.replace('file://', ''))
+      const scriptDir = path.dirname(uri.replace('file://', ''))
+
+      // Resolve the directory to search and the filename prefix
+      let searchDir: string
+      let filePrefix: string
+
+      if (searchPrefix.startsWith('/')) {
+        // Absolute path
+        searchDir = path.dirname(searchPrefix)
+        filePrefix = path.basename(searchPrefix)
+      } else {
+        // Relative path — resolve against the script's directory
+        const resolved = path.resolve(scriptDir, searchPrefix)
+        if (searchPrefix.endsWith('/') || searchPrefix === '') {
+          searchDir = resolved
+          filePrefix = ''
+        } else {
+          searchDir = path.dirname(resolved)
+          filePrefix = path.basename(resolved)
+        }
+      }
+
       const entries = fs.readdirSync(searchDir, { withFileTypes: true })
 
       const completions: BashCompletionItem[] = []
       for (const entry of entries) {
-        if (entry.name.startsWith(searchPrefix)) {
-          completions.push({
-            label: entry.name,
-            kind: entry.isDirectory()
-              ? LSP.CompletionItemKind.Folder
-              : LSP.CompletionItemKind.File,
-            data: { type: CompletionItemDataType.Symbol },
-            insertText: entry.name.slice(searchPrefix.length),
-          })
-        }
+        if (entry.name.startsWith('.') && !filePrefix.startsWith('.')) continue
+        if (filePrefix && !entry.name.startsWith(filePrefix)) continue
+
+        const suffix = entry.isDirectory() ? '/' : ''
+        completions.push({
+          label: entry.name + suffix,
+          kind: entry.isDirectory()
+            ? LSP.CompletionItemKind.Folder
+            : LSP.CompletionItemKind.File,
+          data: { type: CompletionItemDataType.Symbol },
+          insertText: (entry.name + suffix).slice(filePrefix.length),
+        })
       }
       return completions
     } catch {
