@@ -45,6 +45,8 @@ type AnalyzedDocument = {
   inlayHints?: InlayHint[]
   /** Dimmed ranges from constexpr branch evaluation. */
   dimmedRanges?: LSP.Range[]
+  /** Source commands with resolved paths that don't exist on disk (for error diagnostics). */
+  sourceErrors?: Array<{ range: LSP.Range; path: string }>
 }
 
 /**
@@ -60,6 +62,8 @@ export default class Analyzer {
   private workspaceFolder: string | null
   /** Cached flow analysis results for sourced files. */
   private uriToFlowBindings: Map<string, FlowBindings> = new Map()
+  /** Tracks dynamically-resolved sourced URIs discovered during flow analysis (per source file). */
+  private uriToFlowSourcedUris: Map<string, Set<string>> = new Map()
 
   public constructor({
     enableSourceErrorDiagnostics = false,
@@ -130,6 +134,40 @@ export default class Analyzer {
       }
     }
 
+    // Re-parse sourced URIs after flow analysis to include dynamically-resolved
+    // source commands (e.g. source "$LIB_DIR/mylib.sh") that were discovered
+    // during flow analysis. Without this, symbols from those files won't appear
+    // in completions, go-to-definition, or workspace symbols.
+    const flowSourcedUris = this.uriToFlowSourcedUris?.get(uri)
+    if (flowSourcedUris) {
+      for (const sourcedUri of flowSourcedUris) {
+        if (!sourcedUris.has(sourcedUri)) {
+          sourcedUris.add(sourcedUri)
+          // Register the sourced file if not already analyzed
+          if (!this.uriToAnalyzedDocument[sourcedUri]) {
+            try {
+              const filePath = sourcedUri.replace('file://', '')
+              if (fs.existsSync(filePath)) {
+                const content = fs.readFileSync(filePath, 'utf8')
+                const sourcedTree = this.parser.parse(content)
+                this.uriToAnalyzedDocument[sourcedUri] = {
+                  document: TextDocument.create(sourcedUri, 'shell', 1, content),
+                  globalDeclarations: getGlobalDeclarations({ tree: sourcedTree, uri: sourcedUri }),
+                  sourcedUris: new Set(),
+                  sourceCommands: [],
+                  tree: sourcedTree,
+                }
+                logger.debug(`Registered dynamically-sourced file: ${sourcedUri}`)
+              }
+            } catch (err) {
+              logger.warn(`Failed to register dynamically-sourced file ${sourcedUri}: ${err}`)
+            }
+          }
+        }
+      }
+      this.uriToFlowSourcedUris.delete(uri)
+    }
+
     this.uriToAnalyzedDocument[uri] = analyzedDoc
 
     if (!this.includeAllWorkspaceSymbols) {
@@ -180,6 +218,10 @@ export default class Analyzer {
     if (!this.config) return
 
     const { pathEnvInit, seedVariables } = this.config
+
+    // Track dynamically-resolved sourced URIs for this file
+    const resolvedSourcedUris = new Set<string>()
+    this.uriToFlowSourcedUris.set(uri, resolvedSourcedUris)
 
     // Determine CWD for this file
     let cwd = path.dirname(uri.replace('file://', ''))
@@ -277,6 +319,9 @@ export default class Analyzer {
         return sourcePath
       },
       analyzeSourcedFile: (sourcedUri: string): FlowBindings => {
+        // Track this dynamically-resolved sourced URI
+        resolvedSourcedUris.add(sourcedUri)
+
         // Check cache first
         const cached = this.uriToFlowBindings.get(sourcedUri)
         if (cached) return cached
@@ -297,6 +342,7 @@ export default class Analyzer {
             cwd: sourcePushd ? path.dirname(filePath) : ctx.cwd,
             inlayHints: [],
             dimmedRanges: [],
+            sourceErrors: [],
           }
 
           // Run flow analysis on the sourced file recursively
@@ -310,6 +356,7 @@ export default class Analyzer {
       trackInlayHints: true,
       inlayHints: [],
       dimmedRanges: [],
+      sourceErrors: [],
     }
 
     // Run the flow analysis
@@ -319,6 +366,7 @@ export default class Analyzer {
     analyzedDoc.flowBindings = flowBindings
     analyzedDoc.inlayHints = ctx.inlayHints
     analyzedDoc.dimmedRanges = ctx.dimmedRanges
+    analyzedDoc.sourceErrors = ctx.sourceErrors
 
     // Also cache
     this.uriToFlowBindings.set(uri, flowBindings)
@@ -352,6 +400,13 @@ export default class Analyzer {
    */
   public getDimmedRanges(uri: string): LSP.Range[] {
     return this.uriToAnalyzedDocument[uri]?.dimmedRanges || []
+  }
+
+  /**
+   * Get source command errors (resolved paths that don't exist on disk).
+   */
+  public getSourceErrors(uri: string): Array<{ range: LSP.Range; path: string }> {
+    return this.uriToAnalyzedDocument[uri]?.sourceErrors || []
   }
 
   /**

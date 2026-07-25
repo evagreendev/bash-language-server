@@ -6,6 +6,7 @@
  * per-loop-iteration, and sourced-file values into a flow-value lattice.
  */
 import * as path from 'node:path'
+import * as fs from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
 import * as LSP from 'vscode-languageserver/node'
@@ -55,6 +56,8 @@ export interface FlowAnalysisContext {
   inlayHints: InlayHint[]
   /** Accumulated dimmed ranges for this file. */
   dimmedRanges: LSP.Range[]
+  /** Source command paths that could not be found on disk (for error diagnostics). */
+  sourceErrors: Array<{ range: LSP.Range; path: string }>
 }
 
 /**
@@ -695,32 +698,72 @@ export class FlowAnalyzer {
       }
     }
 
-    // Try to resolve the source path
+    // Always resolve the actual source path for the inlay hint (the path bash
+    // would use at runtime), regardless of shellcheck directives.
+    const actualResolvedPath = FlowAnalyzer.resolvePathFromArg(sourcePathArg, bindings, ctx, state.pwd)
+
+    // Resolve the path for binding merging (shellcheck directive overrides).
+    // Also determine the display path for the inlay hint.
     let resolvedUri: string | null = null
+    let displayPath: string | null = null
 
     if (explicitPath) {
-      // Use the explicit source= path
+      // Use the explicit source= path for both bindings and display
       const resolved = FlowAnalyzer.resolveAbsolutePath(
         explicitPath,
         ctx.sourcePushd ? path.dirname(fileURLToPath(ctx.uri)) : state.pwd,
       )
       if (resolved) {
         resolvedUri = `file://${resolved}`
+        displayPath = resolved
+      } else {
+        displayPath = explicitPath
       }
-    } else {
-      // Try to resolve using flow analysis
-      const resolvedPath = FlowAnalyzer.resolvePathFromArg(sourcePathArg, bindings, ctx, state.pwd)
-      if (resolvedPath) {
-        resolvedUri = `file://${resolvedPath}`
-      } else if (fallbackPath) {
-        // Use the source-fallback path
-        const resolved = FlowAnalyzer.resolveAbsolutePath(
-          fallbackPath,
-          ctx.sourcePushd ? path.dirname(fileURLToPath(ctx.uri)) : state.pwd,
-        )
-        if (resolved) {
-          resolvedUri = `file://${resolved}`
+    } else if (actualResolvedPath) {
+      resolvedUri = `file://${actualResolvedPath}`
+      displayPath = actualResolvedPath
+    } else if (fallbackPath) {
+      // Use the source-fallback path
+      const resolved = FlowAnalyzer.resolveAbsolutePath(
+        fallbackPath,
+        ctx.sourcePushd ? path.dirname(fileURLToPath(ctx.uri)) : state.pwd,
+      )
+      if (resolved) {
+        resolvedUri = `file://${resolved}`
+        displayPath = resolved
+      }
+    }
+
+    // Emit inlay hint showing the resolved path.
+    // When a shellcheck source= directive is present, it is authoritative.
+    if (ctx.trackInlayHints) {
+      if (displayPath) {
+        const exists = fs.existsSync(displayPath)
+        ctx.inlayHints.push({
+          position: LSP.Position.create(
+            node.endPosition.row,
+            node.endPosition.column,
+          ),
+          label: exists ? `→ ${displayPath}` : `✗ not found: ${displayPath}`,
+          paddingLeft: true,
+        })
+
+        if (!exists) {
+          ctx.sourceErrors.push({
+            range: TreeSitterUtil.range(node),
+            path: displayPath,
+          })
         }
+      } else {
+        // Could not resolve — show the literal source argument
+        ctx.inlayHints.push({
+          position: LSP.Position.create(
+            node.endPosition.row,
+            node.endPosition.column,
+          ),
+          label: `? ${sourcePathArg.text}`,
+          paddingLeft: true,
+        })
       }
     }
 
@@ -2381,6 +2424,7 @@ export class FlowAnalyzer {
       trackInlayHints: false,
       inlayHints: [],
       dimmedRanges: [],
+      sourceErrors: [],
     })
 
     if (result.success && result.value) {

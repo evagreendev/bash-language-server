@@ -361,6 +361,20 @@ export default class BashServer {
           ),
         )
       }
+
+      // Add error diagnostics for source commands that reference missing files
+      const sourceErrors = this.analyzer.getSourceErrors(uri)
+      for (const { range, path: sourcePath } of sourceErrors) {
+        diagnostics.push(
+          LSP.Diagnostic.create(
+            range,
+            `Sourced file not found: ${sourcePath}`,
+            LSP.DiagnosticSeverity.Error,
+            undefined,
+            'bash-language-server (flow analysis)',
+          ),
+        )
+      }
     }
 
     // Run ShellCheck diagnostics:
