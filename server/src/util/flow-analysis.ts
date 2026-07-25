@@ -13,6 +13,7 @@ import * as LSP from 'vscode-languageserver/node'
 import { SyntaxNode } from 'web-tree-sitter'
 
 import { parseShellCheckDirective } from '../shellcheck/directive'
+import { parseBashIdeDirectives } from './bash-ide-directives'
 import {
   ConcreteValue,
   concrete,
@@ -170,6 +171,10 @@ export class FlowAnalyzer {
         // (they only affect parent scope when called, which requires full interprocedural
         // analysis — beyond scope for now)
         FlowAnalyzer.analyzeFunction(node, bindings, ctx, state)
+        break
+
+      case 'comment':
+        FlowAnalyzer.analyzeComment(node, bindings, ctx, state)
         break
 
       case 'compound_statement':
@@ -779,6 +784,71 @@ export class FlowAnalyzer {
             bindings.set(key, join(existing, value))
           } else {
             bindings.set(key, value)
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * Analyze a comment node for bash-ide directives.
+   *
+   * Handles # bash-ide source=<path> — declares a file to source for IDE
+   * purposes regardless of runtime flow. The file's bindings are merged and
+   * symbols are registered, even inside dead code blocks like `if false`.
+   */
+  private static analyzeComment(
+    node: SyntaxNode,
+    bindings: FlowBindings,
+    ctx: FlowAnalysisContext,
+    state: { pwd: string },
+  ): void {
+    const text = node.text
+    if (!text.includes('bash-ide')) return
+
+    const directives = parseBashIdeDirectives(text)
+    for (const d of directives.directives) {
+      if (d.type === 'source' && d.value) {
+        const resolved = FlowAnalyzer.resolveAbsolutePath(
+          d.value,
+          ctx.sourcePushd ? path.dirname(fileURLToPath(ctx.uri)) : state.pwd,
+        )
+        if (resolved) {
+          const resolvedUri = `file://${resolved}`
+          const finalUri = ctx.resolveSource
+            ? ctx.resolveSource(resolvedUri, ctx.uri)
+            : resolvedUri
+
+          if (finalUri) {
+            // Emit inlay hint
+            if (ctx.trackInlayHints) {
+              const exists = fs.existsSync(resolved)
+              ctx.inlayHints.push({
+                position: LSP.Position.create(
+                  node.endPosition.row,
+                  node.endPosition.column,
+                ),
+                label: exists ? `→ ${resolved}` : `✗ not found: ${resolved}`,
+                paddingLeft: true,
+              })
+              if (!exists) {
+                ctx.sourceErrors.push({
+                  range: TreeSitterUtil.range(node),
+                  path: resolved,
+                })
+              }
+            }
+
+            // Merge bindings from the declared source file
+            const sourcedBindings = ctx.analyzeSourcedFile(finalUri)
+            for (const [key, value] of sourcedBindings) {
+              const existing = bindings.get(key)
+              if (existing) {
+                bindings.set(key, join(existing, value))
+              } else {
+                bindings.set(key, value)
+              }
+            }
           }
         }
       }

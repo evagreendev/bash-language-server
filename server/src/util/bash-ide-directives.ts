@@ -8,19 +8,20 @@
  *   ... (commands to run for env init)
  *   # bash-ide env-init-end
  *   # bash-ide source-pushd
+ *   # bash-ide source=<path>
  */
 
 /**
  * Types of bash-ide directives.
  */
-export type BashIdeDirectiveType = 'cwd' | 'env-init' | 'env-init-begin' | 'env-init-end' | 'source-pushd'
+export type BashIdeDirectiveType = 'cwd' | 'env-init' | 'env-init-begin' | 'env-init-end' | 'source-pushd' | 'source'
 
 /**
  * A parsed bash-ide directive.
  */
 export interface BashIdeDirective {
   type: BashIdeDirectiveType
-  /** The value for cwd and env-init directives. */
+  /** The value for cwd, env-init, and source directives. */
   value?: string
   /** The line number (0-indexed) where this directive appears. */
   line: number
@@ -95,6 +96,9 @@ export function parseBashIdeDirectives(fileContent: string): {
       directives.push({ type: 'env-init', value, line: i })
     } else if (content === 'source-pushd') {
       directives.push({ type: 'source-pushd', line: i })
+    } else if (content.startsWith('source=')) {
+      const value = content.slice(7).trim()
+      directives.push({ type: 'source', value, line: i })
     }
   }
 

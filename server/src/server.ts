@@ -1080,7 +1080,10 @@ export default class BashServer {
   }
 
   /**
-   * Provide path completions inside shellcheck source=/source-fallback= directives.
+   * Provide completions inside comment directives:
+   *   # shellcheck source=/source-fallback=  → file paths
+   *   # bash-ide <keyword>                   → directive keywords (source=, cwd=, etc.)
+   *   # bash-ide source=<path>               → file paths
    */
   private getShellcheckDirectiveCompletions(
     params: LSP.TextDocumentPositionParams,
@@ -1097,17 +1100,64 @@ export default class BashServer {
       end: { line: position.line + 1, character: 0 },
     })
 
-    // Check if we're in a shellcheck source=/source-fallback= directive
-    const sourceMatch = lineText.match(/#\s*shellcheck\s+(?:.*\s+)?(source|source-fallback)=(.*)$/)
-    if (!sourceMatch) return []
+    // ── bash-ide keyword completions ──
+    const bashIdeKeywordMatch = lineText.match(/^\s*#\s*bash-ide\s+(.*)$/)
+    if (bashIdeKeywordMatch) {
+      const afterBashIde = bashIdeKeywordMatch[1] ?? ''
 
-    const afterEquals = sourceMatch[2] || ''
-    const searchPrefix = word.startsWith('#') ? afterEquals : afterEquals
+      // If afterBashIde already contains '=', it's a value being typed (e.g. source=./path)
+      // → offer file path completions for source=
+      if (afterBashIde.includes('=')) {
+        const sourcePathMatch = afterBashIde.match(/^source=(.*)$/)
+        if (sourcePathMatch) {
+          const searchPrefix = sourcePathMatch[1] ?? ''
+          return this.getDirectiveFilePathCompletions(uri, searchPrefix)
+        }
+        // Other key=value directives with path-like values (cwd=) could go here
+        return []
+      }
 
-    // Use the workspace folder to search for files
-    const rootPath = this.workspaceFolder
-    if (!rootPath) return []
+      // No '=' yet → offer directive keyword completions
+      const keywords = [
+        { label: 'source=', detail: 'Declare a file to source for IDE symbol resolution' },
+        { label: 'cwd=', detail: 'Set the working directory for relative path resolution' },
+        { label: 'env-init=', detail: 'Set environment variables for flow analysis' },
+        { label: 'env-init-begin', detail: 'Start a multi-line env-init block' },
+        { label: 'env-init-end', detail: 'End a multi-line env-init block' },
+        { label: 'source-pushd', detail: 'Source files use pushd working directory semantics' },
+      ]
 
+      const filtered = afterBashIde
+        ? keywords.filter((k) => k.label.startsWith(afterBashIde))
+        : keywords
+
+      return filtered.map((k) => ({
+        label: k.label,
+        kind: LSP.CompletionItemKind.Keyword,
+        detail: k.detail,
+        data: { type: CompletionItemDataType.Symbol },
+      }))
+    }
+
+    // ── shellcheck source=/source-fallback= file path completions ──
+    const sourceMatch = lineText.match(
+      /#\s*shellcheck\s+(?:.*\s+)?(source|source-fallback)=(.*)$/,
+    )
+    if (sourceMatch) {
+      const afterEquals = sourceMatch[2] || ''
+      return this.getDirectiveFilePathCompletions(uri, afterEquals)
+    }
+
+    return []
+  }
+
+  /**
+   * List files in the directory of `uri` matching the given prefix.
+   */
+  private getDirectiveFilePathCompletions(
+    uri: string,
+    searchPrefix: string,
+  ): BashCompletionItem[] {
     try {
       const searchDir = path.dirname(uri.replace('file://', ''))
       const entries = fs.readdirSync(searchDir, { withFileTypes: true })
