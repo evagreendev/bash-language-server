@@ -1250,6 +1250,16 @@ exports[`server onRenameRequest Workspace-wide rename returns correct WorkspaceE
   "changes": {
     "file://__REPO_ROOT_FOLDER__/testing/fixtures/comment-doc-on-hover.sh": [],
     "file://__REPO_ROOT_FOLDER__/testing/fixtures/extension.inc": [],
+    "file://__REPO_ROOT_FOLDER__/testing/fixtures/flow-analysis/arithmetic.sh": [],
+    "file://__REPO_ROOT_FOLDER__/testing/fixtures/flow-analysis/array.sh": [],
+    "file://__REPO_ROOT_FOLDER__/testing/fixtures/flow-analysis/basic-assignment.sh": [],
+    "file://__REPO_ROOT_FOLDER__/testing/fixtures/flow-analysis/case.sh": [],
+    "file://__REPO_ROOT_FOLDER__/testing/fixtures/flow-analysis/concatenation.sh": [],
+    "file://__REPO_ROOT_FOLDER__/testing/fixtures/flow-analysis/declare.sh": [],
+    "file://__REPO_ROOT_FOLDER__/testing/fixtures/flow-analysis/if-constexpr.sh": [],
+    "file://__REPO_ROOT_FOLDER__/testing/fixtures/flow-analysis/loops.sh": [],
+    "file://__REPO_ROOT_FOLDER__/testing/fixtures/flow-analysis/parameter-expansion.sh": [],
+    "file://__REPO_ROOT_FOLDER__/testing/fixtures/flow-analysis/source-lib.sh": [],
     "file://__REPO_ROOT_FOLDER__/testing/fixtures/install.sh": [
       {
         "newText": "newName",
@@ -1298,6 +1308,7 @@ exports[`server onRenameRequest Workspace-wide rename returns correct WorkspaceE
     "file://__REPO_ROOT_FOLDER__/testing/fixtures/options.sh": [],
     "file://__REPO_ROOT_FOLDER__/testing/fixtures/override-executable-symbol.sh": [],
     "file://__REPO_ROOT_FOLDER__/testing/fixtures/parse-problems.sh": [],
+    "file://__REPO_ROOT_FOLDER__/testing/fixtures/path-completion.sh": [],
     "file://__REPO_ROOT_FOLDER__/testing/fixtures/renaming-read.sh": [],
     "file://__REPO_ROOT_FOLDER__/testing/fixtures/renaming.sh": [
       {
@@ -1357,6 +1368,16 @@ exports[`server onRenameRequest Workspace-wide rename returns correct WorkspaceE
   "changes": {
     "file://__REPO_ROOT_FOLDER__/testing/fixtures/comment-doc-on-hover.sh": [],
     "file://__REPO_ROOT_FOLDER__/testing/fixtures/extension.inc": [],
+    "file://__REPO_ROOT_FOLDER__/testing/fixtures/flow-analysis/arithmetic.sh": [],
+    "file://__REPO_ROOT_FOLDER__/testing/fixtures/flow-analysis/array.sh": [],
+    "file://__REPO_ROOT_FOLDER__/testing/fixtures/flow-analysis/basic-assignment.sh": [],
+    "file://__REPO_ROOT_FOLDER__/testing/fixtures/flow-analysis/case.sh": [],
+    "file://__REPO_ROOT_FOLDER__/testing/fixtures/flow-analysis/concatenation.sh": [],
+    "file://__REPO_ROOT_FOLDER__/testing/fixtures/flow-analysis/declare.sh": [],
+    "file://__REPO_ROOT_FOLDER__/testing/fixtures/flow-analysis/if-constexpr.sh": [],
+    "file://__REPO_ROOT_FOLDER__/testing/fixtures/flow-analysis/loops.sh": [],
+    "file://__REPO_ROOT_FOLDER__/testing/fixtures/flow-analysis/parameter-expansion.sh": [],
+    "file://__REPO_ROOT_FOLDER__/testing/fixtures/flow-analysis/source-lib.sh": [],
     "file://__REPO_ROOT_FOLDER__/testing/fixtures/install.sh": [],
     "file://__REPO_ROOT_FOLDER__/testing/fixtures/issue101.sh": [],
     "file://__REPO_ROOT_FOLDER__/testing/fixtures/issue206.sh": [],
@@ -1379,6 +1400,7 @@ exports[`server onRenameRequest Workspace-wide rename returns correct WorkspaceE
     "file://__REPO_ROOT_FOLDER__/testing/fixtures/options.sh": [],
     "file://__REPO_ROOT_FOLDER__/testing/fixtures/override-executable-symbol.sh": [],
     "file://__REPO_ROOT_FOLDER__/testing/fixtures/parse-problems.sh": [],
+    "file://__REPO_ROOT_FOLDER__/testing/fixtures/path-completion.sh": [],
     "file://__REPO_ROOT_FOLDER__/testing/fixtures/renaming-read.sh": [],
     "file://__REPO_ROOT_FOLDER__/testing/fixtures/renaming.sh": [
       {
