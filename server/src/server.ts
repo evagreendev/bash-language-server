@@ -508,6 +508,7 @@ export default class BashServer {
     )
 
     if (word?.startsWith('#')) {
+      logger.info(`[completion] entering comment handler: word=${JSON.stringify(word)}`)
       // Inside a comment block — check for shellcheck source=/source-fallback= directive completion
       return this.getShellcheckDirectiveCompletions(params, word)
     }
@@ -1094,24 +1095,61 @@ export default class BashServer {
     const document = this.documents.get(uri)
     if (!document) return []
 
-    // Get the current line text
+    // Get the current line text (strip trailing newline if present)
     const lineText = document.getText({
       start: { line: position.line, character: 0 },
       end: { line: position.line + 1, character: 0 },
-    })
+    }).replace(/\n$/, '')
 
     // ── bash-ide keyword completions ──
     const bashIdeKeywordMatch = lineText.match(/^\s*#\s*bash-ide\s+(.*)$/)
+    logger.info(
+      `[completion] directive: lineText=${JSON.stringify(lineText)} ` +
+      `bashIdeMatch=${!!bashIdeKeywordMatch}`,
+    )
     if (bashIdeKeywordMatch) {
       const afterBashIde = bashIdeKeywordMatch[1] ?? ''
 
       // If afterBashIde already contains '=', it's a value being typed (e.g. source=./path)
       // → offer file path completions for source=
       if (afterBashIde.includes('=')) {
-        const sourcePathMatch = afterBashIde.match(/^source=(.*)$/)
+        const sourcePathMatch =
+          afterBashIde.match(/^source=(.*)$/) ||
+          afterBashIde.match(/^transitive-source=(.*)$/)
+        logger.info(
+          `[completion] directive: afterBashIde=${JSON.stringify(afterBashIde)} ` +
+          `hasEq=true sourceMatch=${!!sourcePathMatch}`,
+        )
         if (sourcePathMatch) {
           const searchPrefix = sourcePathMatch[1] ?? ''
-          return this.getDirectiveFilePathCompletions(uri, searchPrefix)
+          // Find where the value starts (after the '=')
+          const equalsIdx =
+            lineText.indexOf('source=') !== -1
+              ? lineText.indexOf('source=') + 'source='.length
+              : lineText.indexOf('transitive-source=') + 'transitive-source='.length
+          const currentFileDir = path.dirname(uri.replace('file://', ''))
+          const files = getFileCompletions(searchPrefix, currentFileDir)
+          logger.info(
+            `[completion] directive: searchPrefix=${JSON.stringify(searchPrefix)} ` +
+            `equalsIdx=${equalsIdx} numFiles=${files.length}`,
+          )
+          // Only replace the last path component, not the whole prefix.
+          // e.g. for './foo/bar' with cursor after 'bar', replace just 'bar'.
+          const lastSlashIdx = searchPrefix.lastIndexOf('/')
+          const componentStart = equalsIdx + lastSlashIdx + 1
+          const editRange: LSP.Range = {
+            start: { line: position.line, character: componentStart },
+            end: position,
+          }
+          return files.map((file) => ({
+            label: file,
+            kind: file.endsWith('/')
+              ? LSP.CompletionItemKind.Folder
+              : LSP.CompletionItemKind.File,
+            data: { type: CompletionItemDataType.Symbol },
+            textEdit: { newText: file, range: editRange },
+            filterText: searchPrefix + file,
+          }))
         }
         // Other key=value directives with path-like values (cwd=) could go here
         return []
@@ -1119,7 +1157,8 @@ export default class BashServer {
 
       // No '=' yet → offer directive keyword completions
       const keywords = [
-        { label: 'source=', detail: 'Declare a file to source for IDE symbol resolution' },
+        { label: 'source=', detail: 'Declare a file to source for IDE symbol resolution (top-level only)' },
+        { label: 'transitive-source=', detail: 'Declare a file to source (effective even from sourced files)' },
         { label: 'cwd=', detail: 'Set the working directory for relative path resolution' },
         { label: 'env-init=', detail: 'Set environment variables for flow analysis' },
         { label: 'env-init-begin', detail: 'Start a multi-line env-init block' },
@@ -1145,64 +1184,27 @@ export default class BashServer {
     )
     if (sourceMatch) {
       const afterEquals = sourceMatch[2] || ''
-      return this.getDirectiveFilePathCompletions(uri, afterEquals)
+      const equalsIdx = lineText.lastIndexOf('=') + 1
+      const currentFileDir = path.dirname(uri.replace('file://', ''))
+      const files = getFileCompletions(afterEquals, currentFileDir)
+      const lastSlashIdx = afterEquals.lastIndexOf('/')
+      const componentStart = equalsIdx + lastSlashIdx + 1
+      const editRange: LSP.Range = {
+        start: { line: position.line, character: componentStart },
+        end: position,
+      }
+      return files.map((file) => ({
+        label: file,
+        kind: file.endsWith('/')
+          ? LSP.CompletionItemKind.Folder
+          : LSP.CompletionItemKind.File,
+        data: { type: CompletionItemDataType.Symbol },
+        textEdit: { newText: file, range: editRange },
+        filterText: afterEquals + file,
+      }))
     }
 
     return []
-  }
-
-  /**
-   * List files relative to the directory of `uri` matching the given prefix.
-   * Handles ./ ../ and absolute prefixes correctly.
-   */
-  private getDirectiveFilePathCompletions(
-    uri: string,
-    searchPrefix: string,
-  ): BashCompletionItem[] {
-    try {
-      const scriptDir = path.dirname(uri.replace('file://', ''))
-
-      // Resolve the directory to search and the filename prefix
-      let searchDir: string
-      let filePrefix: string
-
-      if (searchPrefix.startsWith('/')) {
-        // Absolute path
-        searchDir = path.dirname(searchPrefix)
-        filePrefix = path.basename(searchPrefix)
-      } else {
-        // Relative path — resolve against the script's directory
-        const resolved = path.resolve(scriptDir, searchPrefix)
-        if (searchPrefix.endsWith('/') || searchPrefix === '') {
-          searchDir = resolved
-          filePrefix = ''
-        } else {
-          searchDir = path.dirname(resolved)
-          filePrefix = path.basename(resolved)
-        }
-      }
-
-      const entries = fs.readdirSync(searchDir, { withFileTypes: true })
-
-      const completions: BashCompletionItem[] = []
-      for (const entry of entries) {
-        if (entry.name.startsWith('.') && !filePrefix.startsWith('.')) continue
-        if (filePrefix && !entry.name.startsWith(filePrefix)) continue
-
-        const suffix = entry.isDirectory() ? '/' : ''
-        completions.push({
-          label: entry.name + suffix,
-          kind: entry.isDirectory()
-            ? LSP.CompletionItemKind.Folder
-            : LSP.CompletionItemKind.File,
-          data: { type: CompletionItemDataType.Symbol },
-          insertText: (entry.name + suffix).slice(filePrefix.length),
-        })
-      }
-      return completions
-    } catch {
-      return []
-    }
   }
 }
 

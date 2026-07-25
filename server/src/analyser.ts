@@ -357,6 +357,7 @@ export default class Analyzer {
       inlayHints: [],
       dimmedRanges: [],
       sourceErrors: [],
+      topLevelUri: uri,
     }
 
     // Run the flow analysis

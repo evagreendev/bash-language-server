@@ -59,6 +59,8 @@ export interface FlowAnalysisContext {
   dimmedRanges: LSP.Range[]
   /** Source command paths that could not be found on disk (for error diagnostics). */
   sourceErrors: Array<{ range: LSP.Range; path: string }>
+  /** URI of the file where flow analysis originated (top-level entry point). */
+  topLevelUri: string
 }
 
 /**
@@ -808,7 +810,14 @@ export class FlowAnalyzer {
 
     const directives = parseBashIdeDirectives(text)
     for (const d of directives.directives) {
-      if (d.type === 'source' && d.value) {
+      // source= only takes effect at the top-level file where flow analysis
+      // originated. transitive-source= works from any sourced file.
+      const isSource = d.type === 'source' && d.value
+      const isTransitiveSource = d.type === 'transitive-source' && d.value
+
+      if (isSource && ctx.uri !== ctx.topLevelUri) continue
+
+      if ((isSource || isTransitiveSource) && d.value) {
         // Expand $VAR / ${VAR} references using current flow bindings
         let expandedPath = d.value
         // Strip surrounding quotes if present (single or double)
@@ -2511,6 +2520,7 @@ export class FlowAnalyzer {
       inlayHints: [],
       dimmedRanges: [],
       sourceErrors: [],
+      topLevelUri: '',
     })
 
     if (result.success && result.value) {

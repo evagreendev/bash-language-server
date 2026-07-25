@@ -744,6 +744,74 @@ function extractStringContent(node: SyntaxNode): string {
 }
 
 /**
+ * Find # bash-ide comment lines and emit fine-grained semantic tokens:
+ *   bash-ide → keyword
+ *   directive name (source, cwd, etc.) → parameter
+ *   = → operator
+ *   value → string
+ */
+function getBashIdeCommentTokens(rootNode: SyntaxNode): HeredocToken[] {
+  const tokens: HeredocToken[] = []
+  const commentNodes = rootNode.descendantsOfType('comment')
+  const bashIdeRegex = /^(\s*#\s*bash-ide\s+)(\w[\w-]*)(=)?(.*)$/
+
+  for (const node of commentNodes) {
+    const text = node.text
+    const match = text.match(bashIdeRegex)
+    if (!match) continue
+
+    const baseCol = node.startPosition.column
+    const line = node.startPosition.row
+
+    const prefixEnd = match[1]!.length          // "# bash-ide "
+    const directiveName = match[2]!              // "source"
+    const hasEquals = match[3] === '='           // "="
+    const value = match[4]!                      // "./path"
+
+    // "bash-ide" part (inside the prefix) as keyword
+    const bashIdeStart = text.indexOf('bash-ide')
+    tokens.push({
+      line,
+      character: baseCol + bashIdeStart,
+      length: 'bash-ide'.length,
+      tokenType: LSP.SemanticTokenTypes.keyword,
+    })
+
+    // Directive name as parameter
+    const nameStart = baseCol + prefixEnd
+    tokens.push({
+      line,
+      character: nameStart,
+      length: directiveName.length,
+      tokenType: LSP.SemanticTokenTypes.parameter,
+    })
+
+    // Equals sign as operator
+    if (hasEquals) {
+      tokens.push({
+        line,
+        character: nameStart + directiveName.length,
+        length: 1,
+        tokenType: LSP.SemanticTokenTypes.operator,
+      })
+    }
+
+    // Value as string
+    if (hasEquals && value.length > 0) {
+      const valueStart = nameStart + directiveName.length + 1
+      tokens.push({
+        line,
+        character: valueStart,
+        length: value.length,
+        tokenType: LSP.SemanticTokenTypes.string,
+      })
+    }
+  }
+
+  return tokens
+}
+
+/**
  * Walk a bash AST and extract semantic tokens for all embedded languages
  * found in heredocs and inline string arguments.
  */
@@ -751,6 +819,9 @@ export function getEmbeddedSemanticTokens(
   rootNode: SyntaxNode,
 ): LSP.SemanticTokens {
   const allTokens: HeredocToken[] = []
+
+  // 0. bash-ide directive comments — highlight as decorators
+  allTokens.push(...getBashIdeCommentTokens(rootNode))
 
   // 1. Heredocs
   const heredocs = rootNode.descendantsOfType('heredoc_redirect')
@@ -892,6 +963,7 @@ export const SEMANTIC_TOKEN_LEGEND: LSP.SemanticTokensLegend = {
     LSP.SemanticTokenTypes.function,
     LSP.SemanticTokenTypes.type,
     LSP.SemanticTokenTypes.parameter,
+    LSP.SemanticTokenTypes.decorator,
   ],
   tokenModifiers: [
     'embedded',
