@@ -673,6 +673,20 @@ export default class BashServer {
           line: params.position.line,
         },
       }
+      // Build the replacement text. When the user is completing inside a
+      // path (e.g. /usr/ or "$HOME"/Documents/), the editRange covers the
+      // entire word component, so newText must include the prefix to avoid
+      // eating the directory path. For example:
+      //   word="/Documents/" + file="BashTab/" → newText="/Documents/BashTab/"
+      //   word="/Documents/Ba" + file="BashTab/" → newText="/Documents/BashTab/"
+      // When word is null (new argument after a command), the range is
+      // zero-width and we just insert the bare filename.
+      const buildNewText = (word: string | null, file: string): string => {
+        if (!word) return file
+        if (word.endsWith('/')) return word + file
+        const lastSlash = word.lastIndexOf('/')
+        return word.substring(0, lastSlash + 1) + file
+      }
       filePathCompletions = files.map((file) => ({
         label: file,
         kind: file.endsWith('/')
@@ -680,7 +694,7 @@ export default class BashServer {
           : LSP.CompletionItemKind.File,
         data: { type: CompletionItemDataType.Symbol },
         textEdit: {
-          newText: file,
+          newText: buildNewText(word, file),
           range: editRange,
         },
         // VS Code filters by fuzzy-matching filterText against the word
