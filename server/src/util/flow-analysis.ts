@@ -244,6 +244,29 @@ export class FlowAnalyzer {
   }
 
   /**
+   * Returns true if the value node is just a bare variable expansion
+   * (e.g. $PWD, "${HOME}"). These already get their own inline reference
+   * hint from evaluateExpansion, so emitting an additional assignment
+   * inlay hint would be redundant.
+   */
+  private static isBareExpansion(valueNode: SyntaxNode | null | undefined): boolean {
+    if (!valueNode) return false
+    // Direct expansion: foo=$PWD
+    if (valueNode.type === 'simple_expansion' || valueNode.type === 'expansion') {
+      return true
+    }
+    // Quoted expansion: foo="$PWD"
+    if (valueNode.type === 'string') {
+      const children = valueNode.namedChildren
+      if (children.length === 1 &&
+          (children[0].type === 'simple_expansion' || children[0].type === 'expansion')) {
+        return true
+      }
+    }
+    return false
+  }
+
+  /**
    * Analyze a variable assignment and update bindings.
    */
   private static analyzeAssignment(
@@ -362,7 +385,7 @@ export class FlowAnalyzer {
       const elements = FlowAnalyzer.extractArrayElements(valueNode, bindings)
       bindings.set(varName, concreteArray(elements))
 
-      if (ctx.trackInlayHints && FlowAnalyzer.isNonTrivialValue(valueNode)) {
+      if (ctx.trackInlayHints && FlowAnalyzer.isNonTrivialValue(valueNode) && !FlowAnalyzer.isBareExpansion(valueNode)) {
         const hintLabel = formatFlowValue(concreteArray(elements))
         if (hintLabel) {
           ctx.inlayHints.push({
@@ -382,7 +405,7 @@ export class FlowAnalyzer {
       bindings.set(varName, flowValue.value)
 
       // Track inlay hint (only for non-trivial values like expansions, arithmetic, etc.)
-      if (ctx.trackInlayHints && FlowAnalyzer.isNonTrivialValue(valueNode)) {
+      if (ctx.trackInlayHints && FlowAnalyzer.isNonTrivialValue(valueNode) && !FlowAnalyzer.isBareExpansion(valueNode)) {
         const hintLabel = formatFlowValue(flowValue.value)
         if (hintLabel) {
           ctx.inlayHints.push({
@@ -576,15 +599,11 @@ export class FlowAnalyzer {
       }
     }
 
-    // Try to resolve using known variable values
+    // Try to resolve using known variable values from flow bindings or env
     if (argNode.type === 'word') {
-      const varName = argNode.text
-      const binding = bindings.get(varName)
-      if (binding) {
-        const val = tryGetSingleValue(binding)
-        if (val) {
-          return FlowAnalyzer.resolveAbsolutePath(val, currentPwd)
-        }
+      const val = FlowAnalyzer.resolveVariableValue(argNode.text, bindings)
+      if (val) {
+        return FlowAnalyzer.resolveAbsolutePath(val, currentPwd)
       }
     }
 
@@ -592,13 +611,18 @@ export class FlowAnalyzer {
       const child = argNode.namedChildren[0]
       if (TreeSitterUtil.isExpansion(child)) {
         const varName = child.text.startsWith('$') ? child.text.slice(1).replace(/[{}]/g, '') : child.text
-        const binding = bindings.get(varName)
-        if (binding) {
-          const val = tryGetSingleValue(binding)
-          if (val) {
-            return FlowAnalyzer.resolveAbsolutePath(val, currentPwd)
-          }
+        const val = FlowAnalyzer.resolveVariableValue(varName, bindings)
+        if (val) {
+          return FlowAnalyzer.resolveAbsolutePath(val, currentPwd)
         }
+      }
+    }
+
+    // Handle multi-child strings with expansions (e.g. "$HOME/subdir")
+    if (argNode.type === 'string' && argNode.namedChildren.length > 1) {
+      const resolved = FlowAnalyzer.resolveStringWithBindings(argNode, bindings)
+      if (resolved) {
+        return FlowAnalyzer.resolveAbsolutePath(resolved, currentPwd)
       }
     }
 
@@ -625,6 +649,26 @@ export class FlowAnalyzer {
   }
 
   /**
+   * Look up a variable's string value, checking flow bindings first,
+   * then falling back to process.env for inherited environment variables
+   * like $HOME, $USER, etc. Returns null if not found.
+   */
+  private static resolveVariableValue(
+    varName: string,
+    bindings: FlowBindings,
+  ): string | null {
+    const binding = bindings.get(varName)
+    if (binding) {
+      const val = tryGetSingleValue(binding)
+      if (val !== null) return val
+    }
+    // Fall back to process.env for inherited environment variables
+    const envValue = process.env[varName]
+    if (envValue !== undefined) return envValue
+    return null
+  }
+
+  /**
    * Try to resolve a concatenation node using known variable bindings.
    */
   private static resolveConcatenationWithBindings(
@@ -643,29 +687,69 @@ export class FlowAnalyzer {
       }
       // Try variable resolution
       if (child.type === 'word') {
-        const binding = bindings.get(child.text)
-        if (binding) {
-          const val = tryGetSingleValue(binding)
+        const val = FlowAnalyzer.resolveVariableValue(child.text, bindings)
+        if (val !== null) {
+          parts.push(val)
+          continue
+        }
+      }
+      if (child.type === 'expansion' || child.type === 'simple_expansion') {
+        const varNameNode = child.descendantsOfType('variable_name')[0]
+        if (varNameNode) {
+          const val = FlowAnalyzer.resolveVariableValue(varNameNode.text, bindings)
           if (val !== null) {
             parts.push(val)
             continue
           }
         }
       }
+      // Handle string children that contain expansions (e.g. "$HOME" within
+      // a concatenation like "$HOME"/script.sh). Extract the expansion and
+      // resolve the variable.
+      if (child.type === 'string') {
+        const resolved = FlowAnalyzer.resolveStringWithBindings(child, bindings)
+        if (resolved !== null) {
+          parts.push(resolved)
+          continue
+        }
+        // Could not resolve the string contents
+        return null
+      }
+      // Can't resolve
+      return null
+    }
+
+    return parts.join('')
+  }
+
+  /**
+   * Try to resolve a string node (e.g. "$HOME") using variable bindings.
+   * Handles strings that contain a single expansion or mixed content
+   * like "prefix${VAR}suffix".
+   */
+  private static resolveStringWithBindings(
+    node: SyntaxNode,
+    bindings: FlowBindings,
+  ): string | null {
+    if (node.type !== 'string') return null
+
+    const parts: string[] = []
+    for (const child of node.namedChildren) {
+      if (child.type === 'string_content') {
+        parts.push(child.text)
+        continue
+      }
       if (child.type === 'expansion' || child.type === 'simple_expansion') {
         const varNameNode = child.descendantsOfType('variable_name')[0]
         if (varNameNode) {
-          const binding = bindings.get(varNameNode.text)
-          if (binding) {
-            const val = tryGetSingleValue(binding)
-            if (val !== null) {
-              parts.push(val)
-              continue
-            }
+          const val = FlowAnalyzer.resolveVariableValue(varNameNode.text, bindings)
+          if (val !== null) {
+            parts.push(val)
+            continue
           }
         }
       }
-      // Can't resolve
+      // Can't resolve this child
       return null
     }
 
@@ -2162,6 +2246,17 @@ export class FlowAnalyzer {
       return { success: true, value: binding }
     }
 
+    // Fall back to process.env for inherited environment variables
+    // like $HOME, $USER, $PATH, etc. that were not assigned in the script.
+    // This matches the behavior of path completions (compgen.ts) which also
+    // resolve these variables via process.env.
+    const envValue = process.env[varName]
+    if (envValue !== undefined) {
+      const envBinding = concrete(envValue, 'assignment')
+      FlowAnalyzer.emitReferenceHint(varName, envBinding, node, ctx)
+      return { success: true, value: envBinding }
+    }
+
     return { success: true, value: unknown() }
   }
 
@@ -2220,7 +2315,7 @@ export class FlowAnalyzer {
   ): void {
     if (!ctx.trackInlayHints) return
 
-    const hintLabel = formatFlowValue(binding)
+    const hintLabel = formatFlowValue(binding, 'parens')
     if (!hintLabel) return
 
     // Place the hint at the end of the variable reference

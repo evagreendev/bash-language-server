@@ -192,17 +192,28 @@ export function hasKnownValue(fv: FlowValue): boolean {
 /**
  * Format a flow value for display (used in inlay hints).
  */
-export function formatFlowValue(fv: FlowValue): string | null {
+export type HintStyle = 'arrow' | 'parens'
+
+/**
+ * Format a flow value for display in inlay hints.
+ *
+ * @param fv The flow value to format.
+ * @param style 'arrow' (assignment hints: → value) or 'parens' (reference hints: (value)).
+ */
+export function formatFlowValue(fv: FlowValue, style: HintStyle = 'arrow'): string | null {
   if (fv.kind === 'concrete') {
     if (fv.values.length === 0) return null
     if (fv.values.length === 1) {
       const v = fv.values[0]
       if (v.elements && v.elements.length > 0) {
-        return `= (${v.elements.map(e => JSON.stringify(e)).join(' ')})`
+        return style === 'arrow'
+          ? `→ (${v.elements.join(' ')})`
+          : `(${v.elements.join(' ')})`
       }
-      return `= ${JSON.stringify(v.text)}`
+      return style === 'arrow' ? `→ ${v.text}` : `(${v.text})`
     }
-    return `∈ {${fv.values.map(v => JSON.stringify(v.text)).join(', ')}}`
+    const joined = fv.values.map(v => v.text).join(', ')
+    return style === 'arrow' ? `∈ {${joined}}` : `(${joined})`
   }
   if (fv.kind === 'dependent') {
     const parts = fv.dependents.map(d => {
@@ -213,7 +224,7 @@ export function formatFlowValue(fv: FlowValue): string | null {
     return parts.join('; ')
   }
   if (fv.kind === 'union') {
-    const parts = fv.values.map(v => formatFlowValue(v)).filter(Boolean)
+    const parts = fv.values.map(v => formatFlowValue(v, style)).filter(Boolean)
     return parts.join(' | ') || null
   }
   return null
