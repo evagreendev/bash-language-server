@@ -144,6 +144,26 @@ export function tryGetSingleValue(fv: FlowValue): string | null {
 }
 
 /**
+ * Resolve a variable's string value from flow bindings, falling back to
+ * process.env for inherited environment variables like $HOME, $USER.
+ * Returns null if the variable is not found in either source.
+ */
+export function resolveFlowVariable(
+  varName: string,
+  bindings?: FlowBindings,
+): string | null {
+  if (bindings) {
+    const binding = bindings.get(varName)
+    if (binding) {
+      const val = tryGetSingleValue(binding)
+      if (val !== null) return val
+    }
+  }
+  const envValue = process.env[varName]
+  return envValue !== undefined ? envValue : null
+}
+
+/**
  * Try to get all concrete values, deduplicated.
  */
 export function tryGetConcreteValues(fv: FlowValue): string[] {

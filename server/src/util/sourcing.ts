@@ -6,7 +6,7 @@ import * as Parser from 'web-tree-sitter'
 import { parseBashIdeDirectives } from './bash-ide-directives'
 import { parseShellCheckDirective } from '../shellcheck/directive'
 import { discriminate } from './discriminate'
-import { tryGetSingleValue } from './flow-value'
+import { resolveFlowVariable } from './flow-value'
 import { untildify } from './fs'
 import * as TreeSitterUtil from './tree-sitter'
 
@@ -148,18 +148,13 @@ function getSourcedPathInfoFromNode({
         if (TreeSitterUtil.isExpansion(variableNode)) {
           const stringContents = argumentNode.text.slice(1, -1)
           
-          // Try to resolve using flow bindings
-          if (flowBindings) {
-            const varNameNode = variableNode.descendantsOfType('variable_name')[0]
-            if (varNameNode) {
-              const binding = flowBindings.get(varNameNode.text)
-              if (binding) {
-                const val = tryGetSingleValue(binding)
-                if (val !== null) {
-                  const remainingPath = stringContents.slice(variableNode.text.length)
-                  return { sourcedPath: val + remainingPath }
-                }
-              }
+          // Try to resolve using flow bindings or env vars
+          const varNameNode = variableNode.descendantsOfType('variable_name')[0]
+          if (varNameNode) {
+            const val = resolveFlowVariable(varNameNode.text, flowBindings)
+            if (val !== null) {
+              const remainingPath = stringContents.slice(variableNode.text.length)
+              return { sourcedPath: val + remainingPath }
             }
           }
           
@@ -168,6 +163,32 @@ function getSourcedPathInfoFromNode({
               sourcedPath: `.${stringContents.slice(variableNode.text.length)}`,
             }
           }
+        }
+      }
+
+      // Handle string with an expansion and additional static content (e.g. "$HOME/.bashrc")
+      if (argumentNode.type === 'string' && argumentNode.namedChildren.length > 1) {
+        // Try to resolve any expansions inside the string
+        const parts: string[] = []
+        let canFullyResolve = true
+        for (const child of argumentNode.namedChildren) {
+          if (child.type === 'string_content') {
+            parts.push(child.text)
+          } else if (TreeSitterUtil.isExpansion(child)) {
+            const varNameNode = child.descendantsOfType('variable_name')[0]
+            if (varNameNode) {
+              const val = resolveFlowVariable(varNameNode.text, flowBindings)
+              if (val !== null) {
+                parts.push(val)
+                continue
+              }
+            }
+            canFullyResolve = false
+            break
+          }
+        }
+        if (canFullyResolve && parts.length > 0) {
+          return { sourcedPath: parts.join('') }
         }
       }
 
@@ -181,14 +202,11 @@ function getSourcedPathInfoFromNode({
         }
       }
 
-      // Try to resolve using flow bindings for variable references
-      if (flowBindings && argumentNode.type === 'word') {
-        const binding = flowBindings.get(argumentNode.text)
-        if (binding) {
-          const val = tryGetSingleValue(binding)
-          if (val !== null) {
-            return { sourcedPath: val }
-          }
+      // Try to resolve using flow bindings or env vars for variable references
+      if (argumentNode.type === 'word') {
+        const val = resolveFlowVariable(argumentNode.text, flowBindings)
+        if (val !== null) {
+          return { sourcedPath: val }
         }
       }
 
@@ -266,21 +284,18 @@ function resolveSourceFromConcatenation(
   // Since the string must begin with the variable, the variable must be in the first child.
   const [firstNode, ...rest] = node.namedChildren
   
-  // Try to resolve first node via flow bindings
-  if (flowBindings && TreeSitterUtil.isExpansion(firstNode)) {
+  // Try to resolve first node via flow bindings or env vars
+  if (TreeSitterUtil.isExpansion(firstNode)) {
     const varNameNode = firstNode.descendantsOfType('variable_name')[0]
     if (varNameNode) {
-      const binding = flowBindings.get(varNameNode.text)
-      if (binding) {
-        const val = tryGetSingleValue(binding)
-        if (val !== null) {
-          for (const child of rest) {
-            const childValue = TreeSitterUtil.resolveStaticString(child)
-            if (childValue === null) return null
-            values.push(childValue)
-          }
-          return val + values.join('')
+      const val = resolveFlowVariable(varNameNode.text, flowBindings)
+      if (val !== null) {
+        for (const child of rest) {
+          const childValue = TreeSitterUtil.resolveStaticString(child)
+          if (childValue === null) return null
+          values.push(childValue)
         }
+        return val + values.join('')
       }
     }
   }
@@ -288,17 +303,39 @@ function resolveSourceFromConcatenation(
   // The first child is static, this means one of the other children is not!
   if (TreeSitterUtil.resolveStaticString(firstNode) !== null) return null
 
-  // if the string is unquoted, the first child is the variable, so there's no more text in it.
+  // Handle a string child containing an expansion (quoted case: "$HOME"/...)
   if (!TreeSitterUtil.isExpansion(firstNode)) {
-    if (firstNode.namedChildCount > 1) return null // Only one variable is allowed.
-    // Since the string must begin with the variable, the variable must be first child.
-    const variableNode = firstNode.namedChildren[0] // Get the variable (quoted case)
-    // This is command substitution!
+    // Find the expansion inside the string (e.g. $HOME within "$HOME")
+    const varNode = firstNode.namedChildren.find(
+      c => TreeSitterUtil.isExpansion(c)
+    )
+    if (varNode) {
+      const varNameNode = varNode.descendantsOfType('variable_name')[0]
+      if (varNameNode) {
+        const val = resolveFlowVariable(varNameNode.text, flowBindings)
+        if (val !== null) {
+          // Build the resolved path: resolved variable + rest of string + rest of concatenation
+          const stringContents = firstNode.text.slice(1, -1)
+          const afterVar = stringContents.slice(
+            stringContents.indexOf(varNode.text) + varNode.text.length,
+          )
+          values.push(val + afterVar)
+          for (const child of rest) {
+            const childValue = TreeSitterUtil.resolveStaticString(child)
+            if (childValue === null) return null
+            values.push(childValue)
+          }
+          return values.join('')
+        }
+      }
+    }
+
+    // Fallback: old behaviour — strip leading variable, return relative path
+    if (firstNode.namedChildCount > 1) return null
+    const variableNode = firstNode.namedChildren[0]
     if (!TreeSitterUtil.isExpansion(variableNode)) return null
     const stringContents = firstNode.text.slice(1, -1)
-    // The string doesn't start with the variable!
     if (!stringContents.startsWith(variableNode.text)) return null
-    // Get the remaining static portion the string
     values.push(stringContents.slice(variableNode.text.length))
   }
 

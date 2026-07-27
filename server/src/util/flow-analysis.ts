@@ -23,6 +23,7 @@ import {
   FlowValue,
   formatFlowValue,
   join,
+  resolveFlowVariable,
   tryGetArrayElements,
   tryGetConcreteValues,
   tryGetSingleValue,
@@ -601,7 +602,7 @@ export class FlowAnalyzer {
 
     // Try to resolve using known variable values from flow bindings or env
     if (argNode.type === 'word') {
-      const val = FlowAnalyzer.resolveVariableValue(argNode.text, bindings)
+      const val = resolveFlowVariable(argNode.text, bindings)
       if (val) {
         return FlowAnalyzer.resolveAbsolutePath(val, currentPwd)
       }
@@ -611,7 +612,7 @@ export class FlowAnalyzer {
       const child = argNode.namedChildren[0]
       if (TreeSitterUtil.isExpansion(child)) {
         const varName = child.text.startsWith('$') ? child.text.slice(1).replace(/[{}]/g, '') : child.text
-        const val = FlowAnalyzer.resolveVariableValue(varName, bindings)
+        const val = resolveFlowVariable(varName, bindings)
         if (val) {
           return FlowAnalyzer.resolveAbsolutePath(val, currentPwd)
         }
@@ -649,26 +650,6 @@ export class FlowAnalyzer {
   }
 
   /**
-   * Look up a variable's string value, checking flow bindings first,
-   * then falling back to process.env for inherited environment variables
-   * like $HOME, $USER, etc. Returns null if not found.
-   */
-  private static resolveVariableValue(
-    varName: string,
-    bindings: FlowBindings,
-  ): string | null {
-    const binding = bindings.get(varName)
-    if (binding) {
-      const val = tryGetSingleValue(binding)
-      if (val !== null) return val
-    }
-    // Fall back to process.env for inherited environment variables
-    const envValue = process.env[varName]
-    if (envValue !== undefined) return envValue
-    return null
-  }
-
-  /**
    * Try to resolve a concatenation node using known variable bindings.
    */
   private static resolveConcatenationWithBindings(
@@ -687,7 +668,7 @@ export class FlowAnalyzer {
       }
       // Try variable resolution
       if (child.type === 'word') {
-        const val = FlowAnalyzer.resolveVariableValue(child.text, bindings)
+        const val = resolveFlowVariable(child.text, bindings)
         if (val !== null) {
           parts.push(val)
           continue
@@ -696,7 +677,7 @@ export class FlowAnalyzer {
       if (child.type === 'expansion' || child.type === 'simple_expansion') {
         const varNameNode = child.descendantsOfType('variable_name')[0]
         if (varNameNode) {
-          const val = FlowAnalyzer.resolveVariableValue(varNameNode.text, bindings)
+          const val = resolveFlowVariable(varNameNode.text, bindings)
           if (val !== null) {
             parts.push(val)
             continue
@@ -742,7 +723,7 @@ export class FlowAnalyzer {
       if (child.type === 'expansion' || child.type === 'simple_expansion') {
         const varNameNode = child.descendantsOfType('variable_name')[0]
         if (varNameNode) {
-          const val = FlowAnalyzer.resolveVariableValue(varNameNode.text, bindings)
+          const val = resolveFlowVariable(varNameNode.text, bindings)
           if (val !== null) {
             parts.push(val)
             continue

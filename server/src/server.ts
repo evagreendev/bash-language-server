@@ -782,14 +782,19 @@ export default class BashServer {
   private onDefinition(params: LSP.TextDocumentPositionParams): LSP.Definition | null {
     const word = this.analyzer.wordAtPointFromTextPosition(params)
     this.logRequest({ request: 'onDefinition', params, word })
-    if (!word) {
-      return null
-    }
-    return this.analyzer.findDeclarationLocations({
+
+    // Check source commands even when word is null — the cursor could be
+    // on a variable expansion like $HOME inside a source command, where
+    // wordAtPoint returns null (expansion nodes have children).
+    const declarations = this.analyzer.findDeclarationLocations({
       position: params.position,
       uri: params.textDocument.uri,
-      word,
+      word: word || '',
     })
+    if (declarations.length > 0) return declarations
+
+    if (!word) return null
+    return declarations
   }
 
   private onDocumentHighlight(
