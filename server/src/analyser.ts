@@ -318,7 +318,7 @@ export default class Analyzer {
         // Resolve source paths using the analyzer
         return sourcePath
       },
-      analyzeSourcedFile: (sourcedUri: string): FlowBindings => {
+      analyzeSourcedFile: (sourcedUri: string, currentPwd?: string): FlowBindings => {
         // Track this dynamically-resolved sourced URI
         resolvedSourcedUris.add(sourcedUri)
 
@@ -334,12 +334,21 @@ export default class Analyzer {
           const content = fs.readFileSync(filePath, 'utf8')
           const sourcedTree = this.parser.parse(content)
 
+          // Determine the initial CWD for the sourced file.
+          // When sourcePushd is true, bash sets the sourced file's context
+          // to its own directory. Otherwise, the sourced file inherits the
+          // caller's PWD at the time of the source command — use currentPwd
+          // (flow-tracked) if available, falling back to ctx.cwd.
+          const sourcedCwd = sourcePushd
+            ? path.dirname(filePath)
+            : (currentPwd || ctx.cwd)
+
           const sourcedCtx: FlowAnalysisContext = {
             ...ctx,
             uri: sourcedUri,
             content,
             rootNode: sourcedTree.rootNode,
-            cwd: sourcePushd ? path.dirname(filePath) : ctx.cwd,
+            cwd: sourcedCwd,
             inlayHints: [],
             dimmedRanges: [],
             sourceErrors: [],
